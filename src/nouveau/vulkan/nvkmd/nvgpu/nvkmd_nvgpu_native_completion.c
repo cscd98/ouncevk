@@ -147,15 +147,14 @@ completion_join(struct nvkmd_nvgpu_native_completion *completion,
    uint64_t counter = 0;
    const Result counter_rc =
       nvkmd_nvgpu_native_completion_read_counter(endpoint, &counter);
-   const enum mode0_progress progress = R_SUCCEEDED(counter_rc) ?
-      mode0_progress(completion->baseline_low, completion->target, counter) :
-      MODE0_PENDING;
-   if (!wait) {
-      if (R_FAILED(counter_rc))
-         return NVKMD_NVGPU_COMPLETION_WAIT;
-      if (progress != MODE0_REACHED)
-         return NVKMD_NVGPU_COMPLETION_PROGRESS;
-   }
+   if (R_FAILED(counter_rc))
+      return NVKMD_NVGPU_COMPLETION_WAIT;
+   const enum mode0_progress progress =
+      mode0_progress(completion->baseline_low, completion->target, counter);
+   if (progress == MODE0_INVALID)
+      return NVKMD_NVGPU_COMPLETION_STATE;
+   if (progress != MODE0_REACHED)
+      return NVKMD_NVGPU_COMPLETION_PROGRESS;
 
    __asm__ volatile("dsb sy" ::: "memory");
    const bool verified = io->verify(io->context);
@@ -164,11 +163,9 @@ completion_join(struct nvkmd_nvgpu_native_completion *completion,
    if (R_FAILED(nvkmd_nvgpu_native_channel_health(endpoint->gpu_fd, &health)))
       return NVKMD_NVGPU_COMPLETION_HEALTH;
 
-   completion->complete = progress == MODE0_REACHED && verified && !health;
+   completion->complete = verified && !health;
    if (completion->complete)
       return NVKMD_NVGPU_COMPLETION_OK;
-   if (progress != MODE0_REACHED)
-      return NVKMD_NVGPU_COMPLETION_PROGRESS;
    if (!verified)
       return NVKMD_NVGPU_COMPLETION_VERIFY;
    return NVKMD_NVGPU_COMPLETION_HEALTH;
@@ -181,7 +178,16 @@ nvkmd_nvgpu_native_completion_finish_endpoint(
    const struct nvkmd_nvgpu_gpu_endpoint *endpoint,
    const struct nvkmd_nvgpu_native_completion_io *io)
 {
-   return completion_join(completion, submit, endpoint, io, true);
+   /* An event wake is only a hint: it can come before the counter reaches the
+    * target. Check the counter first, so that finished work needs no wake,
+    * then wait for a wake and check again until the target is reached or
+    * the wait times out or fails. A pending counter is not device loss; the
+    * accepted batch and its storage stay alive meanwhile. */
+   enum nvkmd_nvgpu_native_completion_status status =
+      completion_join(completion, submit, endpoint, io, false);
+   while (status == NVKMD_NVGPU_COMPLETION_PROGRESS)
+      status = completion_join(completion, submit, endpoint, io, true);
+   return status;
 }
 
 enum nvkmd_nvgpu_native_completion_status

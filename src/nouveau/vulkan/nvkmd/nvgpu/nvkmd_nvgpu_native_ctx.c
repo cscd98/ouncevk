@@ -37,6 +37,10 @@ enum {
    NATIVE_CTX_MAX_INFLIGHT = 8,
 };
 static const uint64_t native_ctx_wait_ns = UINT64_C(5000000000);
+/* The wait for GSV to acknowledge a cancelled event registration. It runs
+ * with the owner lock held, so it is bounded.
+ */
+static const uint64_t native_gsv_cancel_wait_ns = UINT64_C(1000000000);
 
 /* Debug switches for cross-queue synchronization faults. 0 is the normal
  * behavior. A test program can set them between submissions. Each batch
@@ -174,6 +178,31 @@ native_ctx_verify(void *context)
  */
 #define NATIVE_GSV_EVENT_MODE 0u
 
+/* Ends the registration of a timed-out wait: disarm it, then wait for the
+ * event. GSV signals the event when it cancels a registration and when one
+ * completes, and an already reached target left it signaled, so this wait
+ * returns at once. The event stays signaled until the next pending arm, and
+ * that next wait arms its own target. Returns false if the event cannot be
+ * used any more.
+ */
+static bool
+native_gsv_event_cancel(struct nvkmd_nvgpu_native_device_owner *owner)
+{
+   Result rc = gsvSyncDisarmEvent(owner->endpoint.sync, owner->gsv_event_slot);
+   owner->gsv_event_status[8] = rc;
+   if (R_SUCCEEDED(rc)) {
+      rc = eventWait(&owner->gsv_event, native_gsv_cancel_wait_ns);
+      owner->gsv_event_status[10] = rc;
+   }
+   owner->gsv_event_armed = false;
+   if (R_FAILED(rc)) {
+      owner->gsv_event_disabled = true;
+      owner->gsv_event_failures++;
+      return false;
+   }
+   return true;
+}
+
 static enum nvkmd_nvgpu_native_event_result
 native_gsv_event_wait_owner(struct nvkmd_nvgpu_native_device_owner *owner,
                             uint32_t producer_id, uint32_t target)
@@ -199,6 +228,14 @@ native_gsv_event_wait_owner(struct nvkmd_nvgpu_native_device_owner *owner,
       owner->gsv_event_slot_allocated = true;
    }
    if (!owner->gsv_event_open) {
+      /* Manual-clear: the client never clears it. The event starts
+       * signaled. Arming a pending target makes GSV clear it and signal it
+       * at completion; arming an already reached target keeps the existing
+       * signal, which is what ends that wait. An auto-clear event loses that
+       * signal: vkmark's first GPU wait hung on the console (14 November
+       * 2026). A wake can also come from a cancellation, so the join checks
+       * the counter itself.
+       */
       rc = gsvSyncCreateEvent(sync, owner->gsv_event_slot, &owner->gsv_event,
                               false);
       owner->gsv_event_status[0] = rc;
@@ -227,8 +264,6 @@ native_gsv_event_wait_owner(struct nvkmd_nvgpu_native_device_owner *owner,
       owner->gsv_event_target = target;
       owner->gsv_event_arms++;
    }
-   if (first)
-      owner->gsv_event_status[4] = eventWait(&owner->gsv_event, 0);
    const uint64_t before = armGetSystemTick();
    /* No global lock across the blocking wait. The arm, disarm and every
     * service request stay under the owner lock. Only this kernel wait on our
@@ -259,6 +294,8 @@ native_gsv_event_wait_owner(struct nvkmd_nvgpu_native_device_owner *owner,
    }
    if (R_VALUE(wait_rc) == KERNELRESULT(TimedOut)) {
       owner->gsv_event_timeouts++;
+      if (!native_gsv_event_cancel(owner))
+         return NVKMD_NVGPU_EVENT_ERROR;
       return NVKMD_NVGPU_EVENT_TIMEOUT;
    }
    owner->gsv_event_failures++;
@@ -437,8 +474,14 @@ native_owner_join_first_mode(struct nvkmd_nvgpu_native_device_owner *owner,
       return VK_TIMEOUT;
    if (!block && status == NVKMD_NVGPU_COMPLETION_PROGRESS)
       return VK_NOT_READY;
-   if (status != NVKMD_NVGPU_COMPLETION_OK)
+   if (status != NVKMD_NVGPU_COMPLETION_OK) {
+      mesa_loge("native: completion join failed: status %u, blocking %u, "
+                "producer %u, baseline %u, target %u",
+                (unsigned)status, (unsigned)block,
+                point->completion.producer_id, point->completion.baseline_low,
+                point->completion.target);
       return native_owner_fail(owner);
+   }
    if (nvkmd_nvgpu_native_arena_release(
           owner->arena_ref, &submission->batch.slice) !=
        NVKMD_NVGPU_NATIVE_ARENA_OK)
