@@ -13,6 +13,9 @@
 
 #include "util/detect_os.h"
 #include "vk_android.h"
+#ifdef VK_USE_PLATFORM_VI_NN
+#include "wsi_common.h"
+#endif
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 #include "nil.h"
@@ -74,7 +77,7 @@ nvk_get_image_plane_format_features(const struct nvk_physical_device *pdev,
       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
    }
 
-   if (nil_format_supports_color_targets(&pdev->info, p_format) && 
+   if (nil_format_supports_color_targets(&pdev->info, p_format) &&
        tiling != VK_IMAGE_TILING_LINEAR) {
       features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
       if (nil_format_supports_blending(&pdev->info, p_format))
@@ -633,6 +636,13 @@ nvk_GetPhysicalDeviceImageFormatProperties2(
        (pImageFormatInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+   /* The native backend binds sparse buffers, but a sparse image
+    * faulted the GPU in CTS sparse_resources.image_sparse_binding
+    * (9 November 2026). Sparse images are not supported there yet. */
+   if (pdev->nvkmd->bounded_sysmem_size_B &&
+       (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties) {
       .maxExtent = maxExtent,
       .maxMipLevels = maxMipLevels,
@@ -721,7 +731,16 @@ nvk_GetPhysicalDeviceSparseImageFormatProperties2(
     uint32_t *pPropertyCount,
     VkSparseImageFormatProperties2 *pProperties)
 {
+   VK_FROM_HANDLE(nvk_physical_device, pdev, physicalDevice);
    VkResult result;
+
+   /* No sparse properties without sparse binding. The native backend turns
+    * the sparse features off.
+    */
+   if (!pdev->vk.supported_features.sparseBinding) {
+      *pPropertyCount = 0;
+      return;
+   }
 
    /* Check if the given format info is valid first before returning sparse
     * props.  The easiest way to do this is to just call
@@ -891,6 +910,12 @@ nvk_image_init(struct nvk_device *dev,
     * we prefer a dedicated allocation for it.
     */
    image->can_compress = nvk_image_can_compress(pdev, image);
+
+#ifdef VK_USE_PLATFORM_VI_NN
+   if (vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA))
+      image->can_compress = false;
+#endif
+
    if (!image->can_compress)
       usage |= NIL_IMAGE_USAGE_UNCOMPRESSED_BIT;
 
@@ -1334,6 +1359,39 @@ nvk_get_image_memory_requirements(struct nvk_device *dev,
       }
    }
 
+#ifdef NVK_NATIVE_BACKING_ENABLED
+   /* Native: a PTE kind other than GENERIC_MEMORY (6) is a depth/stencil
+    * kind. A plane with such a kind can go only in the kind alias of the
+    * GPU-cacheable pool (nvkmd_nvgpu_native_owner_kind_alias). The memory
+    * types of that pool are not host visible.
+    */
+   for (uint8_t p = 0; p < image->plane_count; p++) {
+      const uint8_t kind = image->planes[p].nil.pte_kind;
+      if (kind != 0 && kind != 6) {
+         for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+            if (pdev->mem_types[i].propertyFlags &
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+               memory_types &= ~BITFIELD_BIT(i);
+         }
+      }
+   }
+
+   /* Native: the device-local types map the GPU-cacheable pool. A host
+    * image copy writes the image with the CPU, and nothing invalidates the
+    * GPU L2 lines of those pages after it. An image with host transfer
+    * usage therefore goes in a host-visible type, which has a GPU-uncached
+    * map. Depth/stencil formats do not support host transfer, so this does
+    * not conflict with the rule above.
+    */
+   if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
+      for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+         if (!(pdev->mem_types[i].propertyFlags &
+               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            memory_types &= ~BITFIELD_BIT(i);
+      }
+   }
+#endif
+
    uint64_t size_B = 0;
    uint32_t align_B = 0;
    if (image->disjoint) {
@@ -1614,7 +1672,41 @@ nvk_image_plane_bind(struct nvk_device *dev,
       if (mem->dedicated_image == image && image->can_compress && not_shared) {
          image->is_compressed = true;
          plane->addr = mem->mem->va->addr + offset_B;
+      } else if (not_shared && image->plane_count == 1 &&
+                 !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+                 /* On Turing and later, NIL gives the GENERIC_MEMORY kind to
+                  * every uncompressed colour format and to D32
+                  * (tu102_choose_pte_kind). The mip, layer, tile and sample
+                  * layout do not change this. The backend checks the kind
+                  * of the range below.
+                  */
+                 mem->mem->ops->can_bind_image_direct &&
+                 (mem->mem->va->addr + offset_B) % plane->plane_align_B == 0 &&
+                 mem->mem->ops->can_bind_image_direct(
+                    mem->mem, plane->nil.pte_kind, plane->nil.tile_mode,
+                    offset_B, plane->nil.size_B)) {
+         /* The backend confirmed that this range of the existing mapping
+          * has the PTE kind of the image. The image does not need to own
+          * the whole VkDeviceMemory.
+          */
+         plane->addr = mem->mem->va->addr + offset_B;
+      } else if (not_shared && image->plane_count == 1 &&
+                 !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
+                 mem->mem->ops->bind_image_kind &&
+                 mem->mem->ops->bind_image_kind(
+                    mem->mem, plane->nil.pte_kind, plane->nil.tile_mode,
+                    offset_B, plane->nil.size_B, &plane->addr) == VK_SUCCESS) {
+         /* The backend gave the pages of the image their PTE kind in
+          * another mapping of this memory. On native, this mapping is the
+          * kind alias.
+          */
       } else {
+         /* Borrowed service-owned memory has only its mapped VA. If the
+          * direct layout does not match, do not reserve another VA or try to
+          * map that service allocation again.
+          */
+         if (mem->backend_borrowed)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
          VkResult result = nvk_image_plane_alloc_va(dev, image, plane);
          if (result != VK_SUCCESS)
             return result;
@@ -1915,7 +2007,7 @@ queue_image_plane_opaque_bind(struct nvk_queue *queue,
                               struct nvk_image_plane *plane,
                               const VkSparseMemoryBind *bind)
 {
-   const uint64_t plane_align_B = plane->plane_align_B; 
+   const uint64_t plane_align_B = plane->plane_align_B;
    const uint64_t plane_size_B = align64(plane->nil.size_B, plane_align_B);
 
    uint64_t plane_offset_B, mem_offset_B, bind_size_B;

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: MIT
+#
+# Main Meson cross file for AArch64 Horizon (Switch 2).
+# It uses devkitA64 GCC and newlib. libounce, mounted at /ounce-nx, takes
+# the place of libnx.
+
+[constants]
+# The Switch 2's CPU has Cortex-A78C cores. The flags match SWITCH2_CPU in
+# libounce's switch2_cpu.mk, which homebrew programs build with; the Rust
+# target (toolchain/rust/aarch64-switch-horizon.json) names the same CPU.
+cpu_args = [
+    '-mcpu=cortex-a78c+crypto',
+    '-mtp=soft',
+    '-fPIC',
+    '-ftls-model=local-exec',
+  ]
+compile_args = [
+    '-D__SWITCH__',
+    '-D__SWITCH2__',
+    '-D_GNU_SOURCE',
+    '-D_DEFAULT_SOURCE',
+    '-I/opt/switch-cross-include',
+    '-I/opt/devkitpro/portlibs/switch/include',
+    '-isystem', '/ounce-nx/include',
+    '-isystem', '/ounce-nx/external/bsd/include',
+    '-include', 'alloca.h',
+  ] + cpu_args + [
+    '-O2',
+    '-ffunction-sections',
+    '-fdata-sections',
+  ]
+link_args = cpu_args + [
+    '-L/opt/devkitpro/portlibs/switch/lib',
+    '-lc',
+    '-lm',
+  ]
+
+[binaries]
+c = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc'
+cpp = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-g++'
+ar = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc-ar'
+strip = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-strip'
+pkgconfig = '/opt/devkitpro/portlibs/switch/bin/aarch64-none-elf-pkg-config'
+
+[built-in options]
+c_args = compile_args
+cpp_args = compile_args
+c_link_args = link_args
+cpp_link_args = link_args
+
+[host_machine]
+system = 'horizon'
+cpu_family = 'aarch64'
+cpu = 'cortex-a57'
+endian = 'little'
+
+[target_machine]
+system = 'horizon'
+cpu_family = 'aarch64'
+cpu = 'cortex-a57'
+endian = 'little'

@@ -40,6 +40,10 @@
 #include "util/u_atomic.h"
 #include "util/u_overflow.h"
 
+#ifdef NVK_NATIVE_HEADLESS
+#include "horizon/runtime_hooks.h"
+#endif
+
 #if DETECT_OS_POSIX_LITE
 #  include <unistd.h> /* usleep */
 #  include <time.h> /* timeval */
@@ -56,9 +60,19 @@
 int64_t
 os_time_get_nano(void)
 {
+#ifdef NVK_NATIVE_HEADLESS
+   /* OunceVK needs a monotonic elapsed time here, not wall-clock time since an
+    * epoch. The CPU counter runs at 31.25 MHz. This is an OunceVK runtime
+    * adapter, not an implementation of the platform time API. */
+   const uint64_t ticks = ouncevk_clock_read_raw();
+   if (ticks > INT64_MAX / OUNCEVK_CLOCK_NS_PER_TICK)
+      __builtin_trap();
+   return (int64_t)(ticks * OUNCEVK_CLOCK_NS_PER_TICK);
+#else
    struct timespec ts;
    timespec_get(&ts, TIME_MONOTONIC);
    return ts.tv_nsec + ts.tv_sec*INT64_C(1000000000);
+#endif
 }
 
 void

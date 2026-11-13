@@ -590,14 +590,14 @@ vk_sync_wait_unwrap(struct vk_device *device,
       VkResult result = vk_sync_timeline_get_point(device, timeline,
                                                    wait->wait_value,
                                                    point_out);
-      if (unlikely(result != VK_SUCCESS)) {
-         /* vk_sync_timeline_get_point() returns VK_NOT_READY if no time
-          * point can be found.  Turn that into an actual error.
-          */
+      if (unlikely(result == VK_NOT_READY)) {
+         /* No time point was found. Report it as an error. */
          return vk_errorf(device, VK_ERROR_UNKNOWN,
                           "Time point >= %"PRIu64" not found",
                           wait->wait_value);
       }
+      if (unlikely(result != VK_SUCCESS))
+         return result;
 
       /* This can happen if the point is long past */
       if (*point_out == NULL) {

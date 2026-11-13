@@ -1048,7 +1048,11 @@ allocate_bo(struct zink_screen *screen, const struct pipe_resource *templ,
    mai.pNext = NULL;
    mai.allocationSize = reqs->size;
    enum zink_heap heap = zink_heap_from_domain_flags(alloc_info->flags, alloc_info->aflags);
-   if (templ->flags & PIPE_RESOURCE_FLAG_MAP_COHERENT) {
+   /* Zink writes descriptor buffers through a persistent coherent map and
+    * never flushes it. On a non-coherent heap, the descriptors can stay in
+    * the CPU cache.
+    */
+   if ((templ->flags & PIPE_RESOURCE_FLAG_MAP_COHERENT) || (templ->bind & ZINK_BIND_DESCRIPTOR)) {
       if (!(vk_domain_from_heap(heap) & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
          heap = zink_heap_from_domain_flags(alloc_info->flags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, alloc_info->aflags);
    }

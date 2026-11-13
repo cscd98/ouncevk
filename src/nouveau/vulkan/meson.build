@@ -16,8 +16,6 @@ nvk_files = files(
   'nvk_cmd_meta.c',
   'nvk_cmd_pool.c',
   'nvk_cmd_pool.h',
-  'nvk_cubin.c',
-  'nvk_cubin.h',
   'nvk_debug.h',
   'nvk_descriptor_set.h',
   'nvk_descriptor_set.c',
@@ -72,12 +70,6 @@ nvk_files = files(
   'nvk_wsi.h',
   'layers/nvk_app_workarounds.c',
   'layers/nvk_app_workarounds.h',
-  'nvkmd/nouveau/nvkmd_nouveau.h',
-  'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
-  'nvkmd/nouveau/nvkmd_nouveau_dev.c',
-  'nvkmd/nouveau/nvkmd_nouveau_mem.c',
-  'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
-  'nvkmd/nouveau/nvkmd_nouveau_va.c',
   'nvkmd/nvkmd.c',
   'nvkmd/nvkmd.h',
 )
@@ -86,6 +78,104 @@ nvkcl_files = files(
   'cl/nvk_query.cl',
   'cl/nvk_copy_indirect.cl',
 )
+
+nvk_common_deps = [
+  dep_libdrm,
+  idep_nak,
+  idep_nil,
+  idep_nir,
+  idep_mesautil,
+  idep_nouveau_mme,
+  idep_nouveau_ws,
+  idep_nvidia_headers,
+  idep_vulkan_runtime,
+  idep_vulkan_util,
+  idep_vulkan_wsi,
+  idep_vulkan_wsi_headers,
+]
+
+# The native game backend calls Switch 2 services only through libounce-nx.
+# Build libounce-nx with SWITCH2=1. In the native-headless cross file, its
+# headers replace the devkitPro libnx headers.
+nvk_native_map_lib = []
+nvk_libounce_nx_link_args = []
+nvk_libounce_nx_include_dirs = []
+nvk_with_native_backing = false
+nvk_libounce_nx = get_option('nvk-libounce-nx')
+if nvk_libounce_nx != ''
+  if host_machine.system() != 'horizon'
+    error('nvk-libounce-nx requires the Horizon target')
+  endif
+  nvk_libounce_nx_include_dirs = [include_directories(
+    join_paths(nvk_libounce_nx, 'include'),
+  )]
+  nvk_native_map_lib = [static_library(
+    'nvk_native_map',
+    files(
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_backing.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_arena_bind.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_mem.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_device_owner.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_chunked.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_host_mem.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_owner_lock.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_pdev.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_ctx.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_progress.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_batch.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_semaphore_probe.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_map.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_channel.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_channel_setup.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_terminal.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_submit.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_completion.c',
+    ),
+    c_args : ['-D__SWITCH2__'],
+    include_directories : [inc_include, inc_src] + nvk_libounce_nx_include_dirs,
+    dependencies : nvk_common_deps,
+    gnu_symbol_visibility : 'hidden',
+  )]
+  # lib/libounce.a is a linker script that names libounce_malloc.a and
+  # libounce_core.a, which the linker finds on the library path.
+  nvk_libounce_nx_link_args = ['-L' + join_paths(nvk_libounce_nx, 'lib'),
+                               '-lounce']
+  nvk_with_native_backing = true
+endif
+
+if host_machine.system() == 'horizon'
+  nvk_files += files(
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_profile.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_profile.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_compute_info.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_compute_info.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_syncobj.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_syncobj.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_release.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_release.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_class_view.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_class_view.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_runtime.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_runtime.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_va.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_va.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_arena.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_native_arena.h',
+    'nvkmd/nvgpu/nvkmd_nvgpu_discovery.c',
+    'nvkmd/nvgpu/nvkmd_nvgpu_discovery.h',
+  )
+else
+  nvk_files += files(
+    'nvk_cubin.c',
+    'nvk_cubin.h',
+    'nvkmd/nouveau/nvkmd_nouveau.h',
+    'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
+    'nvkmd/nouveau/nvkmd_nouveau_dev.c',
+    'nvkmd/nouveau/nvkmd_nouveau_mem.c',
+    'nvkmd/nouveau/nvkmd_nouveau_pdev.c',
+    'nvkmd/nouveau/nvkmd_nouveau_va.c',
+  )
+endif
 
 nvk_entrypoints = custom_target(
   'nvk_entrypoints',
@@ -134,24 +224,16 @@ nvk_drirc = custom_target(
   ],
 )
 
-nvk_deps = [
-  dep_libdrm,
-  dep_elf,
-  idep_nak,
-  idep_nil,
-  idep_nir,
-  idep_mesautil,
-  idep_nouveau_cubin,
-  idep_nouveau_mme,
-  idep_nouveau_ws,
-  idep_nvidia_headers,
-  idep_vulkan_runtime,
-  idep_vulkan_util,
-  idep_vulkan_wsi,
-  idep_vulkan_wsi_headers,
-]
+nvk_deps = nvk_common_deps
+
+if host_machine.system() != 'horizon'
+  nvk_deps += [dep_elf, idep_nouveau_cubin]
+endif
 
 nvk_flags = []
+if nvk_with_native_backing
+  nvk_flags += '-DNVK_NATIVE_BACKING_ENABLED'
+endif
 
 nvk_build_id = get_option('nvk-build-id')
 if nvk_build_id != ''
@@ -162,20 +244,54 @@ if with_platform_android
   nvk_files += files('nvk_android.c')
 endif
 
+# Horizon has no Vulkan loader. A program links the driver statically and
+# calls vkCreateInstance and the other API functions by name. This file
+# defines them.
+nvk_horizon_exports = []
+if host_machine.system() == 'horizon'
+  nvk_horizon_exports = custom_target(
+    'nvk_horizon_exports',
+    input : [files('nvk_horizon_exports_gen.py'), vk_api_xml],
+    output : 'nvk_horizon_exports.c',
+    command : [
+      prog_python, '@INPUT0@', '--xml', '@INPUT1@',
+      '--import-path', join_paths(dir_source_root, 'src/vulkan/util'),
+      '--out', '@OUTPUT@',
+    ],
+    depend_files : vk_entrypoints_gen_depend_files,
+  )
+endif
+
+# Horizon has no ELF build-id note to key the shader cache. This header gets
+# a new value in every build, so a cache entry never outlives the compiler
+# that made it (nvk_instance.c).
+nvk_horizon_build_stamp = []
+if host_machine.system() == 'horizon'
+  nvk_horizon_build_stamp = custom_target(
+    'nvk_horizon_build_stamp',
+    output : 'nvk_horizon_build_stamp.h',
+    command : [
+      prog_python, '-c',
+      'import sys, time; q = chr(34); open(sys.argv[1], "w").write("#define NVK_HORIZON_BUILD_STAMP " + q + str(time.time_ns()) + q + chr(10))',
+      '@OUTPUT@',
+    ],
+    build_always_stale : true,
+  )
+endif
+
 libnvk = static_library(
   'nvk',
   [
     nvk_entrypoints,
+    nvk_horizon_exports,
+    nvk_horizon_build_stamp,
     nvk_drirc,
     cl_generated,
     nvk_files,
     nvkcl,
     sha1_h,
   ],
-  include_directories : [
-    inc_include,
-    inc_src,
-  ],
+  include_directories : [inc_include, inc_src] + nvk_libounce_nx_include_dirs,
   dependencies : nvk_deps,
   c_args : [no_override_init_args, nvk_flags],
   gnu_symbol_visibility : 'hidden',
@@ -183,8 +299,8 @@ libnvk = static_library(
 
 libvulkan_nouveau = shared_library(
   'vulkan_nouveau',
-  link_whole : [libnvk],
-  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],
+  link_whole : [libnvk] + nvk_native_map_lib,
+  link_args: [ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections] + nvk_libounce_nx_link_args,
   gnu_symbol_visibility : 'hidden',
   install : true,
 )

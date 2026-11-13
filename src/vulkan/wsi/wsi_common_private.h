@@ -307,6 +307,14 @@ struct wsi_swapchain {
    VkResult (*acquire_next_image)(struct wsi_swapchain *swap_chain,
                                   const VkAcquireNextImageInfoKHR *info,
                                   uint32_t *image_index);
+   /* Optional. Creates the payload for an acquire semaphore (GPU_WAIT) or
+    * fence (CPU_WAIT) when the previous presentation of the acquired image
+    * still waits for its release. Returns VK_ERROR_FEATURE_NOT_PRESENT when
+    * no release is pending. The caller then uses a dummy payload. */
+   VkResult (*create_acquire_sync)(struct wsi_swapchain *swap_chain,
+                                   const struct wsi_image *image,
+                                   enum vk_sync_features features,
+                                   struct vk_sync **sync_out);
    VkResult (*queue_present)(struct wsi_swapchain *swap_chain,
                              uint32_t image_index,
                              uint64_t present_id,
@@ -560,6 +568,12 @@ VkResult wsi_metal_init_wsi(struct wsi_device *wsi_device,
                            VkPhysicalDevice physical_device);
 void wsi_metal_finish_wsi(struct wsi_device *wsi_device,
                           const VkAllocationCallbacks *alloc);
+
+VkResult wsi_switch_init_wsi(struct wsi_device *wsi_device,
+                            const VkAllocationCallbacks *alloc,
+                            VkPhysicalDevice physical_device);
+void wsi_switch_finish_wsi(struct wsi_device *wsi_device,
+                           const VkAllocationCallbacks *alloc);
 
 
 VkResult

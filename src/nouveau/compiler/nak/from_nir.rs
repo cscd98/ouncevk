@@ -383,7 +383,7 @@ struct ShaderFromNir<'a> {
     end_block_id: u32,
     ssa_map: FxHashMap<u32, Vec<SSAValue>>,
     saturated: FxHashSet<*const nir_def>,
-    nir_instr_printer: NirInstrPrinter,
+    nir_instr_printer: Option<NirInstrPrinter>,
 }
 
 impl<'a> ShaderFromNir<'a> {
@@ -408,7 +408,9 @@ impl<'a> ShaderFromNir<'a> {
             end_block_id: 0,
             ssa_map: Default::default(),
             saturated: Default::default(),
-            nir_instr_printer: NirInstrPrinter::new().unwrap(),
+            // Create the printer only for annotation. Ordinary compilation
+            // must not open a FILE.
+            nir_instr_printer: None,
         }
     }
 
@@ -2860,11 +2862,15 @@ impl<'a> ShaderFromNir<'a> {
                 let coord = self.get_image_coord(intrin, dim);
                 // let sample = self.get_src(&srcs[2]);
 
-                let mem_order = if (intrin.access() & ACCESS_CAN_REORDER) != 0 {
-                    MemOrder::Constant
-                } else {
-                    MemOrder::Strong(MemScope::GPU)
-                };
+                // Upstream uses MemOrder::Constant for a load that can be
+                // reordered (a read-only image). On the Switch 2 GPU, with
+                // the image in GPU-cached memory, such loads did not see
+                // data that the 3D engine had just written (a blit, a draw
+                // or another shader's stores): the shader read zeros, the
+                // same texels on every run (CTS synchronization.op R8
+                // storage image cases). GPU-strong order reads the current
+                // data.
+                let mem_order = MemOrder::Strong(MemScope::GPU);
 
                 let comps = intrin.num_components;
                 assert!(intrin.def.bit_size() == 32);
@@ -4322,6 +4328,7 @@ impl<'a> ShaderFromNir<'a> {
             if DEBUG.annotate() {
                 let annotation = self
                     .nir_instr_printer
+                    .get_or_insert_with(|| NirInstrPrinter::new().unwrap())
                     .instr_to_string(ni)
                     .unwrap()
                     .split_whitespace()
@@ -4372,6 +4379,7 @@ impl<'a> ShaderFromNir<'a> {
             if DEBUG.annotate() && ni.type_ != nir_instr_type_phi {
                 let annotation = self
                     .nir_instr_printer
+                    .get_or_insert_with(|| NirInstrPrinter::new().unwrap())
                     .instr_to_string(ni)
                     .unwrap()
                     .split_whitespace()
@@ -4450,6 +4458,7 @@ impl<'a> ShaderFromNir<'a> {
                 if DEBUG.annotate() {
                     let annotation = self
                         .nir_instr_printer
+                        .get_or_insert_with(|| NirInstrPrinter::new().unwrap())
                         .instr_to_string(ni)
                         .unwrap()
                         .split_whitespace()

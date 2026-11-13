@@ -206,32 +206,34 @@ nir_inline_function_impl(struct nir_builder *b,
 
 static bool inline_function_impl(nir_function_impl *impl, struct set *inlined);
 
-static bool
-inline_functions_pass(nir_builder *b,
-                      nir_instr *instr,
-                      void *cb_data)
+/* Returns the call if the instruction is a call that inlining replaces. */
+static nir_call_instr *
+instr_as_inlined_call(const nir_shader *shader, nir_instr *instr)
 {
-   struct set *inlined = cb_data;
    if (instr->type != nir_instr_type_call)
-      return false;
+      return NULL;
 
    nir_call_instr *call = nir_instr_as_call(instr);
    if (!call->callee->impl)
-      return false;
+      return NULL;
 
    assert(!call->indirect_callee.ssa);
 
-   if (b->shader->options->driver_functions &&
-       b->shader->info.stage == MESA_SHADER_KERNEL) {
+   if (shader->options->driver_functions &&
+       shader->info.stage == MESA_SHADER_KERNEL) {
       bool last_instr = (instr == nir_block_last_instr(instr->block));
       if (!nir_function_can_inline(call->callee) && !last_instr) {
-         return false;
+         return NULL;
       }
    }
 
-   /* Make sure that the function we're calling is already inlined */
-   inline_function_impl(call->callee->impl, inlined);
+   return call;
+}
 
+/* Replaces the call by a copy of the body of its callee. */
+static void
+inline_call(nir_builder *b, nir_call_instr *call)
+{
    b->cursor = nir_instr_remove(&call->instr);
 
    /* Rewrite all of the uses of the callee's parameters to use the call
@@ -247,6 +249,23 @@ inline_functions_pass(nir_builder *b,
 
    nir_inline_function_impl(b, call->callee->impl, params, NULL);
    STACK_ARRAY_FINISH(params);
+}
+
+static bool
+inline_functions_pass(nir_builder *b,
+                      nir_instr *instr,
+                      void *cb_data)
+{
+   struct set *inlined = cb_data;
+
+   nir_call_instr *call = instr_as_inlined_call(b->shader, instr);
+   if (call == NULL)
+      return false;
+
+   /* Make sure that the function we're calling is already inlined */
+   inline_function_impl(call->callee->impl, inlined);
+
+   inline_call(b, call);
    return true;
 }
 
@@ -346,6 +365,102 @@ nir_inline_functions(nir_shader *shader)
    }
 
    _mesa_set_destroy(inlined, NULL);
+
+   return progress;
+}
+
+/* The first instruction of the block or, if the block is empty, of the
+ * blocks after it in the function.
+ */
+static nir_instr *
+first_instr_from_block(nir_block *block)
+{
+   for (; block != NULL; block = nir_block_cf_tree_next(block)) {
+      nir_instr *instr = nir_block_first_instr(block);
+      if (instr != NULL)
+         return instr;
+   }
+   return NULL;
+}
+
+/* The instruction that follows in the function, in program order. */
+static nir_instr *
+next_instr_in_impl(nir_instr *instr)
+{
+   nir_instr *next = nir_instr_next(instr);
+   if (next != NULL)
+      return next;
+   return first_instr_from_block(nir_block_cf_tree_next(instr->block));
+}
+
+/* Replaces every call in the function by the body of its callee, and so on
+ * for the calls in that body, until the function makes no calls.
+ */
+static bool
+inline_functions_into_impl(nir_function_impl *impl)
+{
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+
+   nir_instr *instr = first_instr_from_block(nir_start_block(impl));
+   while (instr != NULL) {
+      nir_call_instr *call = instr_as_inlined_call(impl->function->shader, instr);
+      if (call == NULL) {
+         instr = next_instr_in_impl(instr);
+         continue;
+      }
+
+      /* The body of the callee takes the place of the call.  A marker in
+       * front of the call keeps that place: afterwards, the instruction
+       * after the marker is the first one of the body, so the walk goes on
+       * through the body and replaces the calls that it makes.
+       */
+      b.cursor = nir_before_instr(instr);
+      nir_instr *marker = &nir_nop(&b)->instr;
+
+      inline_call(&b, call);
+
+      instr = next_instr_in_impl(marker);
+      nir_instr_remove(marker);
+      progress = true;
+   }
+
+   if (progress) {
+      /* Indices are completely messed up now */
+      nir_index_ssa_defs(impl);
+   }
+
+   return nir_progress(progress, impl, nir_metadata_none);
+}
+
+/**
+ * Inlines all calls into the functions that stay after inlining: the
+ * entrypoints and the functions of cooperative matrix calls.
+ *
+ * Use it in place of nir_inline_functions() when
+ * nir_remove_non_entrypoints() or nir_remove_non_cmat_call_entrypoints()
+ * removes the other functions afterwards.  The other functions keep their
+ * calls.  The functions that stay get the same body as from
+ * nir_inline_functions().
+ *
+ * nir_inline_functions() inlines the calls of every function, and copies a
+ * callee with everything already inlined into it to each of its callers.
+ * With call chains of depth N, that copies about N times the instructions
+ * that the entrypoint has in the end.  This function copies each callee as
+ * it is, at the place of each call that the entrypoint reaches, which is
+ * only what the entrypoint has in the end.
+ */
+bool
+nir_inline_functions_into_entrypoints(nir_shader *shader)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      if (impl->function->is_entrypoint || impl->function->cmat_call)
+         progress |= inline_functions_into_impl(impl);
+      else
+         nir_no_progress(impl);
+   }
 
    return progress;
 }

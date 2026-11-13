@@ -10,10 +10,13 @@
 #include "nvk_physical_device.h"
 #include "nvkmd/nvkmd.h"
 
+#include "vk_format.h"
 #include "util/u_atomic.h"
 
 #include <inttypes.h>
-#include <sys/mman.h>
+#ifndef __SWITCH__
+#include <sys/mman.h> /* absent on Horizon */
+#endif
 
 /* Supports opaque fd only */
 const VkExternalMemoryProperties nvk_opaque_fd_mem_props = {
@@ -39,6 +42,53 @@ const VkExternalMemoryProperties nvk_dma_buf_mem_props = {
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 };
 
+/* Host allocations (VK_EXT_external_memory_host): import only. */
+const VkExternalMemoryProperties nvk_host_ptr_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = 0,
+   .compatibleHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+};
+
+/* The memory types an imported host pointer can have: host-visible,
+ * CPU-cached and not coherent. The CPU keeps its cached view of the
+ * program's memory, so flush and invalidate do the cache maintenance. */
+static uint32_t
+nvk_host_ptr_memory_type_bits(const struct nvk_physical_device *pdev)
+{
+   if (!pdev->nvkmd->has_host_ptr_import)
+      return 0;
+   uint32_t type_bits = 0;
+   for (uint32_t t = 0; t < pdev->mem_type_count; t++) {
+      const VkMemoryPropertyFlags props = pdev->mem_types[t].propertyFlags;
+      if ((props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+          (props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+          !(props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+         type_bits |= 1u << t;
+   }
+   return type_bits;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_GetMemoryHostPointerPropertiesEXT(
+   VkDevice device,
+   VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   VK_FROM_HANDLE(nvk_device, dev, device);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
+   /* Memory mapped from a foreign device is not supported. */
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+       !nvkmd_dev_host_ptr_importable(dev->nvkmd, pHostPointer))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   pMemoryHostPointerProperties->memoryTypeBits =
+      nvk_host_ptr_memory_type_bits(pdev);
+   return VK_SUCCESS;
+}
+
 static enum nvkmd_mem_flags
 nvk_memory_type_flags(const VkMemoryType *type,
                       VkExternalMemoryHandleTypeFlagBits handle_types,
@@ -58,6 +108,8 @@ nvk_memory_type_flags(const VkMemoryType *type,
 
    if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
       flags |= NVKMD_MEM_COHERENT;
+   else if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+      flags |= NVKMD_MEM_CPU_CACHED;
 
    if (handle_types != 0)
       flags |= NVKMD_MEM_SHARED;
@@ -144,6 +196,11 @@ nvk_AllocateMemory(VkDevice device,
 
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkImportMemoryHostPointerInfoEXT *host_ptr_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+   if (host_ptr_info != NULL && host_ptr_info->handleType == 0)
+      host_ptr_info = NULL;
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
    const VkMemoryDedicatedAllocateInfo *dedicated_info =
@@ -156,6 +213,8 @@ nvk_AllocateMemory(VkDevice device,
       handle_types |= export_info->handleTypes;
    if (fd_info != NULL)
       handle_types |= fd_info->handleType;
+   if (host_ptr_info != NULL)
+      handle_types |= host_ptr_info->handleType;
 
    const bool not_shared = handle_types == 0;
    bool pinned_to_vram = false;
@@ -200,17 +259,57 @@ nvk_AllocateMemory(VkDevice device,
             alignment = (1ULL << 21);
          else
             alignment = (1ULL << 16);
+      } else if (pdev->nvkmd->bounded_sysmem_size_B && not_shared &&
+                 !image->can_compress && image->plane_count == 1 &&
+                 image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+                 image->vk.image_type == VK_IMAGE_TYPE_2D &&
+                 image->vk.extent.depth == 1 &&
+                 image->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+                 vk_format_get_blocksize(image->vk.format) == 4 &&
+                 image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+                 image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+                 !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) {
+         /* First native image profile: keep the NIL uncompressed kind, tile
+          * mode and alignment. The kind-6 backing is already mapped.
+          */
+         alignment = MAX2(alignment, image->planes[0].nil.align_B);
+         pte_kind = image->planes[0].nil.pte_kind;
+         tile_mode = image->planes[0].nil.tile_mode;
       }
    }
 
+   /* Only the compression branch above sets pinned_to_vram. */
    const enum nvkmd_mem_flags flags =
-      nvk_memory_type_flags(type, handle_types, pinned_to_vram);
+      nvk_memory_type_flags(type, handle_types, pinned_to_vram) |
+      (pinned_to_vram ? NVKMD_MEM_COMPRESSED : 0);
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
 
-   const bool is_import = fd_info && fd_info->handleType;
-   if (is_import) {
+   const bool is_import = (fd_info && fd_info->handleType) ||
+                          host_ptr_info != NULL;
+   if (host_ptr_info != NULL) {
+      /* The pointer and size are multiples of
+       * minImportedHostPointerAlignment, and the memory type is one of
+       * vkGetMemoryHostPointerPropertiesEXT's (valid usage). Check them
+       * anyway: the backend registers exactly this span. */
+      const uint64_t align_B = pdev->nvkmd->host_ptr_align_B;
+      if (host_ptr_info->handleType !=
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+          !align_B || (uintptr_t)host_ptr_info->pHostPointer % align_B ||
+          pAllocateInfo->allocationSize % align_B ||
+          !(nvk_host_ptr_memory_type_bits(pdev) &
+            (1u << pAllocateInfo->memoryTypeIndex))) {
+         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto fail_alloc;
+      }
+      result = nvkmd_dev_import_host_ptr(dev->nvkmd, &dev->vk.base,
+                                         host_ptr_info->pHostPointer,
+                                         pAllocateInfo->allocationSize,
+                                         flags, &mem->mem);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
+   } else if (is_import) {
       assert(fd_info->handleType ==
                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
              fd_info->handleType ==
@@ -330,7 +429,8 @@ nvk_FreeMemory(VkDevice device,
 
    const VkMemoryType *type = &pdev->mem_types[mem->vk.memory_type_index];
    struct nvk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
-   p_atomic_add(&heap->used, -((int64_t)mem->mem->size_B));
+   if (!mem->backend_borrowed)
+      p_atomic_add(&heap->used, -((int64_t)mem->mem->size_B));
 
    nvkmd_mem_unref(mem->mem);
 

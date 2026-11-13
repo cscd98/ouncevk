@@ -168,7 +168,8 @@ nvk_CreateQueryPool(VkDevice device,
    if (mem_size > 0) {
       result = nvkmd_dev_alloc_mapped_mem(dev->nvkmd, &dev->vk.base,
                                           mem_size, 0 /* align_B */,
-                                          NVKMD_MEM_GART,
+                                          NVKMD_MEM_GART |
+                                          NVKMD_MEM_GPU_UNCACHED,
                                           NVKMD_MEM_MAP_RDWR,
                                           &pool->mem);
       if (result != VK_SUCCESS) {
@@ -253,7 +254,7 @@ static void
 nvk_sync_queries_to_gpu(struct nvk_query_pool *pool,
                         uint32_t first_query, uint32_t count)
 {
-   if (pool->mem->flags & NVKMD_MEM_COHERENT)
+   if (!nvkmd_mem_is_cpu_cacheable(pool->mem))
       return;
 
    assert(pool->layout != NVK_QUERY_POOL_LAYOUT_SEPARATE);
@@ -265,7 +266,7 @@ static void
 nvk_sync_queries_from_gpu(struct nvk_query_pool *pool,
                           uint32_t first_query, uint32_t count)
 {
-   if (pool->mem->flags & NVKMD_MEM_COHERENT)
+   if (!nvkmd_mem_is_cpu_cacheable(pool->mem))
       return;
 
    assert(pool->layout != NVK_QUERY_POOL_LAYOUT_SEPARATE);

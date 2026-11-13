@@ -42,6 +42,15 @@
 #include <stdlib.h>
 #endif
 
+#if DETECT_OS_HORIZON
+/* newlib declares secure_getenv() but does not define it. Use getenv() instead. */
+char *
+secure_getenv(const char *name)
+{
+   return getenv(name);
+}
+#endif
+
 
 void
 _debug_vprintf(const char *format, va_list ap)

@@ -161,6 +161,12 @@ typedef struct {
 struct per_op_table {
    const uint16_t *filter;
    unsigned num_filtered_states;
+   /* A row of the transition table holds num_filtered_states transitions:
+    * one for each filtered state of the last source. When rows is NULL,
+    * table holds all rows. Otherwise table holds each different row one
+    * time, and rows[r] is the index in table of row r.
+    */
+   const uint16_t *rows;
    const uint16_t *table;
 };
 

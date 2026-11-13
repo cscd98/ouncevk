@@ -60,7 +60,7 @@
 #  include <unistd.h>
 #  include <android/log.h>
 #  include <sys/system_properties.h>
-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
+#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM || DETECT_OS_HORIZON
 #  include <unistd.h>
 #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
 #  include <sys/resource.h>
@@ -359,7 +359,14 @@ os_set_option(const char *name, const char *value, bool override)
 bool
 os_get_total_physical_memory(uint64_t *size)
 {
-#if HAVE_SYSCONF
+#ifdef NVK_NATIVE_HEADLESS
+   /* Horizon GetInfo 21 and 22 report process memory accounting. They do not
+    * report physical memory or a GPU heap that OunceVK owns. There is no
+    * verified native sysconf ABI or GPU allocation budget yet. Return failure
+    * until one of them exists. */
+   (void)size;
+   return false;
+#elif HAVE_SYSCONF || DETECT_OS_HORIZON
    const long phys_pages = sysconf(_SC_PHYS_PAGES);
    const long page_size = sysconf(_SC_PAGESIZE);
 
@@ -416,7 +423,12 @@ os_get_total_physical_memory(uint64_t *size)
 bool
 os_get_available_system_memory(uint64_t *size)
 {
-#if DETECT_OS_LINUX
+#ifdef NVK_NATIVE_HEADLESS
+   /* Do not report process total minus used memory as available GPU
+    * memory. */
+   (void)size;
+   return false;
+#elif DETECT_OS_LINUX
    char *meminfo = os_read_file("/proc/meminfo", NULL);
    if (!meminfo)
       return false;
@@ -487,7 +499,11 @@ os_get_available_system_memory(uint64_t *size)
 bool
 os_get_page_size(uint64_t *size)
 {
-#if HAVE_SYSCONF
+#if DETECT_OS_HORIZON
+   /* Always report 4 KiB pages to prevent possible problems. */
+   *size = 4096;
+   return true;
+#elif HAVE_SYSCONF
    const long page_size = sysconf(_SC_PAGESIZE);
 
    if (page_size <= 0)

@@ -766,23 +766,33 @@ nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
       if (tbl->num_filtered_states == 0)
          return false;
 
-      /* Calculate the index into the transition table. Note the index
-       * calculated must match the iteration order of Python's
-       * itertools.product(), which was used to emit the transition
-       * table.
+      /* Calculate the row and the column in the transition table. The
+       * filtered states of all sources except the last select the row, and
+       * the filtered state of the last source selects the column. Note the
+       * row calculated must match the iteration order of Python's
+       * itertools.product(), which was used to emit the transition table.
        */
-      unsigned index = 0;
-      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
-         index *= tbl->num_filtered_states;
+      const unsigned num_inputs = nir_op_infos[op].num_inputs;
+      unsigned row = 0;
+      unsigned column = 0;
+      for (unsigned i = 0; i < num_inputs; i++) {
+         unsigned filtered = 0;
          if (tbl->filter)
-            index += tbl->filter[*util_dynarray_element(states, uint16_t,
-                                                        alu->src[i].src.ssa->index)];
+            filtered = tbl->filter[*util_dynarray_element(states, uint16_t,
+                                                          alu->src[i].src.ssa->index)];
+         if (i + 1 < num_inputs)
+            row = row * tbl->num_filtered_states + filtered;
+         else
+            column = filtered;
       }
+      if (tbl->rows)
+         row = tbl->rows[row];
+      const uint16_t next = tbl->table[row * tbl->num_filtered_states + column];
 
       uint16_t *state = util_dynarray_element(states, uint16_t,
                                               alu->def.index);
-      if (*state != tbl->table[index]) {
-         *state = tbl->table[index];
+      if (*state != next) {
+         *state = next;
          return true;
       }
       return false;

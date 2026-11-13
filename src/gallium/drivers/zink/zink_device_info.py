@@ -787,7 +787,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
          %else:
          } else {
          %endif
-            debug_printf("ZINK: ${ext.name} required!\\n");
+            mesa_loge("ZINK: ${ext.name} required");
             goto fail;
       %endif
          }

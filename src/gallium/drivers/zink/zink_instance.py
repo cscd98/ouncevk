@@ -48,6 +48,7 @@ EXTENSIONS = [
     Extension("VK_KHR_wayland_surface"),
     Extension("VK_KHR_xcb_surface"),
     Extension("VK_KHR_win32_surface"),
+    Extension("VK_NN_vi_surface"),
     Extension("VK_EXT_swapchain_colorspace"),
 ]
 
@@ -154,8 +155,11 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceExtensionProperties);
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceLayerProperties);
    if (!vk_EnumerateInstanceExtensionProperties ||
-       !vk_EnumerateInstanceLayerProperties)
+       !vk_EnumerateInstanceLayerProperties) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: no vkEnumerateInstance*Properties entry points");
       return NULL;
+   }
 
    // Build up the extensions from the reported ones but only for the unnamed layer
    uint32_t extension_count = 0;

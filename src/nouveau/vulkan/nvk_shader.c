@@ -561,8 +561,10 @@ nvk_compile_nir(struct nvk_device *dev, nir_shader *nir,
    if (rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT)
       robust2_modes |= nir_var_mem_ssbo;
 
+   const uint64_t nak_start = nir_pass_timing_begin();
    shader->nak = nak_compile_shader(nir, dump_asm, pdev->nak,
                                     robust2_modes, fs_key, has_task_shader);
+   nir_pass_timing_end("phase: nak_compile_shader (postprocess and backend)", nak_start);
    if (!shader->nak)
       return vk_errorf(pdev, VK_ERROR_UNKNOWN, "Internal compiler error in NAK");
 
@@ -1123,9 +1125,11 @@ nvk_compile_shader(struct nvk_device *dev,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
+   const uint64_t lower_start = nir_pass_timing_begin();
    nvk_lower_nir(dev, nir, info->flags, info->robustness,
                  info->set_layout_count, info->set_layouts,
                  &shader->cbuf_map);
+   nir_pass_timing_end("phase: nvk_lower_nir", lower_start);
 
    struct nak_fs_key fs_key_tmp, *fs_key = NULL;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -1234,6 +1238,10 @@ nvk_compile_shaders(struct vk_device *vk_dev,
       }
    }
 
+   /* With NIR_PASS_TIMING set, this compile's pass times, including the
+    * SPIR-V translation and preprocessing that came before it.
+    */
+   nir_pass_timing_report("nvk_compile_shaders");
    return VK_SUCCESS;
 }
 

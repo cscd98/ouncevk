@@ -49,6 +49,7 @@
 #include "util/xmlconfig.h"
 
 #include "util/u_cpu_detect.h"
+#include "util/detect_os.h"
 
 #ifdef HAVE_LIBDRM
 #include <xf86drm.h>
@@ -1859,7 +1860,7 @@ update_queue_props(struct zink_screen *screen)
       mesa_loge("ZINK: failed to allocate props!");
       return;
    }
-      
+
    VKSCR(GetPhysicalDeviceQueueFamilyProperties)(screen->pdev, &num_queues, props);
 
    bool found_gfx = false;
@@ -3389,6 +3390,31 @@ zink_cl_cts_version(struct pipe_screen *pscreen)
    return "v2024-08-08-00";
 }
 
+#ifdef __SWITCH__
+extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName);
+extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vk_common_GetDeviceProcAddr(VkDevice device, const char *pName);
+
+/* Report zero instance layers. Without this entry point, Zink gets NULL and
+ * fails silently at startup. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+switch_EnumerateInstanceLayerProperties(uint32_t *pCount, VkLayerProperties *pProps)
+{
+   *pCount = 0;
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+switch_GetInstanceProcAddr(VkInstance instance, const char *pName)
+{
+   if (instance == VK_NULL_HANDLE && pName &&
+       !strcmp(pName, "vkEnumerateInstanceLayerProperties"))
+      return (PFN_vkVoidFunction)switch_EnumerateInstanceLayerProperties;
+   return vk_icdGetInstanceProcAddr(instance, pName);
+}
+#endif
+
 static struct zink_screen *
 zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
 {
@@ -3422,6 +3448,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    u_trace_state_init();
 
+#ifdef __SWITCH__
+   /* Give Zink the ICD entry point directly. Device functions resolve
+    * through Mesa's common GetDeviceProcAddr. */
+   screen->loader_lib = NULL;
+   screen->vk_GetInstanceProcAddr =
+      (PFN_vkGetInstanceProcAddr)switch_GetInstanceProcAddr;
+   screen->vk_GetDeviceProcAddr =
+      (PFN_vkGetDeviceProcAddr)vk_common_GetDeviceProcAddr;
+#else
    screen->loader_lib = util_dl_open(VK_LIBNAME);
    if (!screen->loader_lib) {
       if (!screen->driver_name_is_inferred)
@@ -3437,6 +3472,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          mesa_loge("ZINK: failed to get proc address");
       goto fail;
    }
+#endif
 
    if (config) {
       driParseConfigFiles(config->options, config->options_info,
@@ -3458,6 +3494,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
        * to create another instance on subsequent calls.
        */
       simple_mtx_unlock(&instance_lock);
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: no Vulkan instance");
       goto fail;
    }
    screen->instance = instance;
@@ -3508,7 +3546,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    if (!zink_get_physical_device_info(screen)) {
       if (!screen->driver_name_is_inferred)
-         debug_printf("ZINK: failed to detect features\n");
+         mesa_loge("ZINK: failed to detect features");
       goto fail;
    }
 
@@ -3595,8 +3633,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    disable_features(screen);
 
    struct zink_device *zdev = zink_create_logical_device(screen);
-   if (!zdev->dev)
+   if (!zdev->dev) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: failed to create the logical device");
       goto fail;
+   }
    screen->dev = zdev->dev;
    screen->queue_lock = &zdev->queue_lock;
 
@@ -3630,8 +3671,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       screen->desc_set_id[ZINK_DESCRIPTOR_BINDLESS] = 5;
    }
 
-   if (screen->info.have_EXT_calibrated_timestamps && !check_have_device_time(screen))
+   if (screen->info.have_EXT_calibrated_timestamps && !check_have_device_time(screen)) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: VK_TIME_DOMAIN_DEVICE_EXT is not calibrateable");
       goto fail;
+   }
 
    screen->have_triangle_fans = true;
 #if defined(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)
@@ -3688,11 +3732,6 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
-   if (!os_get_total_physical_memory(&screen->total_mem)) {
-      if (!screen->driver_name_is_inferred)
-         mesa_loge("ZINK: failed to get total physical memory");
-      goto fail;
-   }
 
    if (screen->info.have_EXT_sample_locations) {
       VkMultisamplePropertiesEXT prop;
@@ -3706,8 +3745,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       }
    }
 
-   if (!zink_screen_resource_init(&screen->base))
+   if (!zink_screen_resource_init(&screen->base)) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: failed to initialize resources");
       goto fail;
+   }
    if (!zink_bo_init(screen)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to initialize suballocator");
@@ -3722,8 +3764,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       goto fail;
    }
    if (!util_queue_init(&screen->cache_get_thread, "zcfq", 8, 4,
-                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen))
+                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen)) {
+      if (!screen->driver_name_is_inferred)
+         mesa_loge("ZINK: failed to start the cache thread");
       goto fail;
+   }
    populate_format_props(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct zink_transfer), 16);
@@ -3783,6 +3828,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       default:
          zink_descriptor_mode = can_db ? ZINK_DESCRIPTOR_MODE_DB : ZINK_DESCRIPTOR_MODE_LAZY;
       }
+      if (DETECT_OS_HORIZON)
+         zink_descriptor_mode = ZINK_DESCRIPTOR_MODE_LAZY;
    }
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
       const uint32_t sampler_size = MAX2(screen->info.db_props.combinedImageSamplerDescriptorSize, screen->info.db_props.robustUniformTexelBufferDescriptorSize);

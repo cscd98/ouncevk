@@ -34,6 +34,38 @@ nvk_queue_state_finish(struct nvk_device *dev,
 {
    if (qs->slm.mem)
       nvkmd_mem_unref(qs->slm.mem);
+   free(qs->init_words);
+}
+
+static void
+nvk_queue_push_pools(struct nvk_queue *queue,
+                     const struct nvk_queue_state *qs, struct nv_push *p);
+
+/* Gives the exec context the words that set this queue's complete channel
+ * state: the context init and the current pools. A backend whose devices
+ * share one hardware channel replays them when another queue has set the
+ * channel state since this queue's last work. */
+static VkResult
+nvk_queue_update_state_replay(struct nvk_queue *queue)
+{
+   const struct nvk_queue_state *qs = &queue->state;
+   uint32_t pool_data[64];
+   struct nv_push pools;
+   nv_push_init(&pools, pool_data, ARRAY_SIZE(pool_data),
+                nvk_queue_subchannels_from_engines(queue->engines));
+   nvk_queue_push_pools(queue, qs, &pools);
+   const uint32_t pool_words = nv_push_dw_count(&pools);
+   const uint32_t count = qs->init_word_count + pool_words;
+   uint32_t *words = malloc(count * sizeof(*words));
+   if (!words)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   memcpy(words, qs->init_words, qs->init_word_count * sizeof(*words));
+   memcpy(words + qs->init_word_count, pool_data,
+          pool_words * sizeof(*words));
+   const VkResult result =
+      nvkmd_ctx_set_state_replay(queue->exec_ctx, words, count);
+   free(words);
+   return result;
 }
 
 static VkResult
@@ -41,7 +73,6 @@ nvk_queue_state_update(struct nvk_queue *queue,
                        struct nvk_queue_state *qs)
 {
    struct nvk_device *dev = nvk_queue_device(queue);
-   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    struct nvkmd_mem *mem;
    uint32_t alloc_count, bytes_per_warp, bytes_per_tpc;
    bool dirty = false;
@@ -61,8 +92,20 @@ nvk_queue_state_update(struct nvk_queue *queue,
    mem = nvk_slm_area_get_mem_ref(&dev->slm, &bytes_per_warp, &bytes_per_tpc);
    if (qs->slm.mem != mem || qs->slm.bytes_per_warp != bytes_per_warp ||
        qs->slm.bytes_per_tpc != bytes_per_tpc) {
-      if (qs->slm.mem)
+      if (qs->slm.mem) {
+#ifdef __SWITCH__
+         /* In-flight work can still use the old area. nvgpu unmaps it on
+          * the last unref.
+          */
+         VkResult result = nvkmd_ctx_sync(queue->exec_ctx, &queue->vk.base);
+         if (result != VK_SUCCESS) {
+            if (mem)
+               nvkmd_mem_unref(mem);
+            return result;
+         }
+#endif
          nvkmd_mem_unref(qs->slm.mem);
+      }
       qs->slm.mem = mem;
       qs->slm.bytes_per_warp = bytes_per_warp;
       qs->slm.bytes_per_tpc = bytes_per_tpc;
@@ -80,7 +123,20 @@ nvk_queue_state_update(struct nvk_queue *queue,
    struct nv_push push;
    nv_push_init(&push, push_data, 64,
                 nvk_queue_subchannels_from_engines(queue->engines));
-   struct nv_push *p = &push;
+   nvk_queue_push_pools(queue, qs, &push);
+   VkResult result = nvk_queue_update_state_replay(queue);
+   if (result != VK_SUCCESS)
+      return result;
+   return nvk_queue_push(queue, &push);
+}
+
+/* The texture header and sampler pools and the shader local memory of qs. */
+static void
+nvk_queue_push_pools(struct nvk_queue *queue,
+                     const struct nvk_queue_state *qs, struct nv_push *p)
+{
+   struct nvk_device *dev = nvk_queue_device(queue);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
 
    if (qs->images.alloc_count > 0) {
       const uint64_t tex_pool_addr =
@@ -164,8 +220,6 @@ nvk_queue_state_update(struct nvk_queue *queue,
          P_NV9097_SET_SHADER_LOCAL_MEMORY_E(p, slm_per_warp);
       }
    }
-
-   return nvk_queue_push(queue, p);
 }
 
 static VkResult
@@ -361,7 +415,20 @@ nvk_queue_init_context_state(struct nvk_queue *queue)
          return result;
    }
 
-   return nvk_queue_push(queue, &push);
+   /* Keep the words: another device on a shared channel can replace this
+    * state (see nvk_queue_update_state_replay). */
+   const uint32_t count = nv_push_dw_count(&push);
+   free(queue->state.init_words);
+   queue->state.init_words = malloc(count * sizeof(uint32_t));
+   if (!queue->state.init_words)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   memcpy(queue->state.init_words, push_data, count * sizeof(uint32_t));
+   queue->state.init_word_count = count;
+
+   result = nvk_queue_push(queue, &push);
+   if (result != VK_SUCCESS)
+      return result;
+   return nvk_queue_update_state_replay(queue);
 }
 
 static VkQueueGlobalPriority

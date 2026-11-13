@@ -34,11 +34,23 @@
 extern "C" {
 #endif
 
+struct vk_sync_timeline_state;
+
 struct vk_sync_timeline_type {
    struct vk_sync_type sync;
 
    /* Type of each individual time point */
    const struct vk_sync_type *point_sync_type;
+
+   /* Optional backend hooks for the lifetime of the state. When they are
+    * NULL, the common timeline ABI and value order do not change. */
+   VkResult (*register_state)(struct vk_device *device,
+                              struct vk_sync_timeline_state *state,
+                              void *data);
+   void (*unregister_state)(struct vk_device *device,
+                            struct vk_sync_timeline_state *state,
+                            void *data);
+   void *state_data;
 };
 
 struct vk_sync_timeline_type
@@ -68,6 +80,10 @@ struct vk_sync_timeline_state {
 
    uint64_t highest_past;
    uint64_t highest_pending;
+   /* A backend can report a permanent failure for a timeline, even if nobody
+    * submitted its next value. The error stays set after the report, so the
+    * timeline can wake the waiters on its condition variable. */
+   VkResult error;
 
    uint32_t refcount;
 
@@ -107,6 +123,15 @@ VkResult vk_sync_timeline_alloc_point(struct vk_device *device,
                                       struct vk_sync_timeline *timeline,
                                       uint64_t value,
                                       struct vk_sync_timeline_point **point_out);
+
+/* A caller that holds a reference to the state can report a permanent
+ * backend failure. This also works after the owning vk_sync starts its
+ * destruction. A failure never advances the timeline value. */
+void vk_sync_timeline_state_ref(struct vk_sync_timeline_state *state);
+void vk_sync_timeline_state_unref(struct vk_device *device,
+                                  struct vk_sync_timeline_state *state);
+void vk_sync_timeline_state_fail(struct vk_sync_timeline_state *state,
+                                 VkResult error);
 
 void vk_sync_timeline_point_unref(struct vk_device *device,
                                   struct vk_sync_timeline_point *point);

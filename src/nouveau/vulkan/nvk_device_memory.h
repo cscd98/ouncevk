@@ -20,6 +20,10 @@ struct nvk_device_memory {
    struct nvk_image *dedicated_image;
 
    struct nvkmd_mem *mem;
+   /* True for a private WSI wrapper of a service-owned target. The heap
+    * does not count this memory. Ordinary allocations leave this false.
+    */
+   bool backend_borrowed;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_device_memory, vk.base, VkDeviceMemory,
@@ -27,5 +31,6 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_device_memory, vk.base, VkDeviceMemory,
 
 extern const VkExternalMemoryProperties nvk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties nvk_dma_buf_mem_props;
+extern const VkExternalMemoryProperties nvk_host_ptr_mem_props;
 
 #endif

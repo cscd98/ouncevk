@@ -38,6 +38,10 @@ if with_platform_macos
   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif
 
+if host_machine.system() == 'horizon'
+  files_vulkan_wsi += files('wsi_switch_native_owner.c', 'wsi_switch_native.c')
+endif
+
 if system_has_kms_drm and not with_platform_android
   files_vulkan_wsi += files('wsi_common_display.c')
 endif
@@ -54,9 +58,20 @@ wsi_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
+# When NVK links the native backing, wsi_common_headless.c gives native game
+# images direct GPU memory with no host blit. This test repeats NVK's
+# selection (nvk_with_native_backing in src/nouveau/vulkan/meson.build:
+# native-headless plus nvk-libounce-nx). Meson configures this library before
+# NVK.
+vulkan_wsi_c_args = []
+if with_nvk_native_headless and get_option('nvk-libounce-nx') != ''
+  vulkan_wsi_c_args += '-DNVK_NATIVE_BACKING_ENABLED'
+endif
+
 libvulkan_wsi = static_library(
   'vulkan_wsi',
   [files_vulkan_wsi, wsi_entrypoints],
+  c_args : vulkan_wsi_c_args,
   include_directories : [inc_include, inc_src],
   dependencies : [
     vulkan_wsi_deps, dep_libdrm, dep_libudev, idep_vulkan_util_headers,

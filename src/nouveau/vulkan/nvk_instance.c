@@ -7,14 +7,25 @@
 #include "nvk_entrypoints.h"
 #include "nvk_physical_device.h"
 #include "nvk_drirc.h"
+#if DETECT_OS_HORIZON
+#include "nvkmd/nvgpu/nvkmd_nvgpu_discovery.h"
+#include "util/log.h"
+#include "util/u_atomic.h"
+#endif
 
 #include "vulkan/wsi/wsi_common.h"
+
+#include "git_sha1.h"
 
 #include "util/build_id.h"
 #include "util/detect_os.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "util/u_debug.h"
+
+#ifndef HAVE_DL_ITERATE_PHDR
+#include "nvk_horizon_build_stamp.h"
+#endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
@@ -30,10 +41,12 @@ static const struct vk_instance_extension_table instance_extensions = {
 #ifdef NVK_USE_WSI_PLATFORM
    .KHR_get_surface_capabilities2 = true,
    .KHR_surface = true,
+#ifndef NVK_NATIVE_HEADLESS
    .KHR_surface_maintenance1 = true,
    .KHR_surface_protected_capabilities = true,
    .EXT_surface_maintenance1 = true,
    .EXT_swapchain_colorspace = true,
+#endif
 #endif
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
    .KHR_wayland_surface = true,
@@ -54,8 +67,12 @@ static const struct vk_instance_extension_table instance_extensions = {
    .EXT_display_surface_counter = true,
    .EXT_acquire_drm_display = true,
 #endif
-#ifndef VK_USE_PLATFORM_WIN32_KHR
+#if !defined(VK_USE_PLATFORM_WIN32_KHR) && \
+    (!defined(NVK_NATIVE_HEADLESS) || defined(NVK_NATIVE_BACKING_ENABLED))
    .EXT_headless_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   .NN_vi_surface = true,
 #endif
    .KHR_device_group_creation = true,
    .KHR_external_fence_capabilities = true,
@@ -93,10 +110,20 @@ nvk_init_debug_flags(struct nvk_instance *instance)
       { "gart", NVK_DEBUG_FORCE_GART },
       { "coherent", NVK_DEBUG_FORCE_COHERENT },
       { "no_compression", NVK_DEBUG_NO_COMPRESSION },
+      { "errors", NVK_DEBUG_ERRORS },
+      { "full_arena_flush", NVK_DEBUG_FULL_ARENA_FLUSH },
+      { "full_cmd_flush", NVK_DEBUG_FULL_CMD_FLUSH },
+      { "meta_copy", NVK_DEBUG_META_COPY },
+      { "split_ce_copy", NVK_DEBUG_SPLIT_CE_COPY },
+      { "no_sector_promotion", NVK_DEBUG_NO_SECTOR_PROMOTION },
+      { "full_push_desc", NVK_DEBUG_FULL_PUSH_DESC },
       { NULL, 0 },
    };
 
    instance->debug_flags = parse_debug_string(os_get_option("NVK_DEBUG"), flags);
+
+   if (instance->debug_flags & NVK_DEBUG_ERRORS)
+      instance->vk.enable_debug_logging = true;
 }
 
 static void
@@ -126,6 +153,14 @@ nvk_init_dri_options(struct nvk_instance *instance)
    if (instance->drirc.debug.zero_vram)
       instance->debug_flags |= NVK_DEBUG_ZERO_MEMORY;
 }
+
+#if DETECT_OS_HORIZON
+/* Instances that exist. When the last one is destroyed, the GPU that the
+ * driver opened for them is retired, as EGL does at eglTerminate. The
+ * process can then open the GPU again through another API, such as
+ * libounce's framebuffer console, or through a new instance. */
+static int nvk_horizon_instance_count;
+#endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
@@ -160,10 +195,16 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    nvk_init_experimental_flags(instance);
    nvk_init_dri_options(instance);
 
+#if DETECT_OS_HORIZON
+   instance->vk.physical_devices.enumerate = nvk_enumerate_physical_device;
+#else
    instance->vk.physical_devices.try_create_for_drm =
       nvk_create_drm_physical_device;
+#endif
    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
 
+   STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+#ifdef HAVE_DL_ITERATE_PHDR
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(nvk_CreateInstance);
    if (!note) {
@@ -179,14 +220,33 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       goto fail_init;
    }
 
-   STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
    copy_build_id_to_sha1(instance->driver_build_sha, note);
+#else
+   /* Horizon has no dl_iterate_phdr to find the ELF build-id note. Make the
+    * driver SHA from values that are known at compile time. The build stamp
+    * changes in every build (meson.build), so the shader cache key changes
+    * when any part of the driver or its compiler changes.
+    */
+   static const char build_stamp[] = NVK_HORIZON_BUILD_STAMP;
+   blake3_hasher build_ctx;
 
+   _mesa_blake3_init(&build_ctx);
+   _mesa_blake3_update(&build_ctx, PACKAGE_VERSION, strlen(PACKAGE_VERSION));
+   _mesa_blake3_update(&build_ctx, MESA_GIT_SHA1, strlen(MESA_GIT_SHA1));
+   _mesa_blake3_update(&build_ctx, build_stamp, sizeof(build_stamp));
+   _mesa_blake3_final(&build_ctx, instance->driver_build_sha);
+#endif
+
+#if DETECT_OS_HORIZON
+   p_atomic_inc(&nvk_horizon_instance_count);
+#endif
    *pInstance = nvk_instance_to_handle(instance);
    return VK_SUCCESS;
 
+#ifdef HAVE_DL_ITERATE_PHDR
 fail_init:
    vk_instance_finish(&instance->vk);
+#endif
 fail_alloc:
    vk_free(pAllocator, instance);
 
@@ -207,6 +267,18 @@ nvk_DestroyInstance(VkInstance _instance,
 
    vk_instance_finish(&instance->vk);
    vk_free(&instance->vk.alloc, instance);
+
+#if DETECT_OS_HORIZON
+   /* The physical devices are gone with the instance. A device that the
+    * application did not destroy keeps the GPU open; then the release
+    * fails and the GPU retires at process exit. */
+   if (p_atomic_dec_zero(&nvk_horizon_instance_count)) {
+      const uint32_t status = nvkmd_nvgpu_native_release_default_platform();
+      if (status)
+         mesa_logw("GPU retirement after the last instance: status 0x%x",
+                   status);
+   }
+#endif
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL

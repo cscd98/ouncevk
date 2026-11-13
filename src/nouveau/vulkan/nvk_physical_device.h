@@ -85,6 +85,10 @@ VkResult nvk_create_drm_physical_device(struct vk_instance *vk_instance,
                                         struct _drmDevice *drm_device,
                                         struct vk_physical_device **pdev_out);
 
+#ifdef __SWITCH__
+VkResult nvk_enumerate_physical_device(struct vk_instance *vk_instance);
+#endif
+
 void nvk_physical_device_destroy(struct vk_physical_device *vk_device);
 
 VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
@@ -93,8 +97,13 @@ VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || \
     defined(VK_USE_PLATFORM_XCB_KHR) || \
     defined(VK_USE_PLATFORM_XLIB_KHR) || \
-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
+    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
+    defined(VK_USE_PLATFORM_VI_NN)
 #define NVK_USE_WSI_PLATFORM
+#endif
+
+#if defined(NVK_NATIVE_HEADLESS) && defined(NVK_USE_WSI_PLATFORM) && !defined(VK_USE_PLATFORM_VI_NN)
+#error "Native profile supports only the dedicated VI2 surface platform"
 #endif
 
 #endif

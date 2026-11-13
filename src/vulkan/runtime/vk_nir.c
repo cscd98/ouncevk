@@ -152,9 +152,11 @@ vk_spirv_to_nir(struct vk_device *device,
    struct nir_spirv_specialization *spec =
       vk_spec_info_to_nir_spirv(spec_info);
 
+   const uint64_t timing_start = nir_pass_timing_begin();
    nir_shader *nir = spirv_to_nir(spirv_data, spirv_size_B / 4,
                                   spec, stage, entrypoint_name,
                                   &spirv_options_local, nir_options);
+   nir_pass_timing_end("phase: spirv_to_nir", timing_start);
    vtn_free_specialization(spec);
 
    if (nir == NULL)
@@ -173,7 +175,12 @@ vk_spirv_to_nir(struct vk_device *device,
     */
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
-   NIR_PASS(_, nir, nir_inline_functions);
+
+   /* Only the entrypoint and the functions of cooperative matrix calls stay
+    * (nir_remove_non_cmat_call_entrypoints below), so inline into those
+    * alone.
+    */
+   NIR_PASS(_, nir, nir_inline_functions_into_entrypoints);
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_deref);

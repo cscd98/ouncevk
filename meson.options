@@ -8,11 +8,17 @@ option(
   description : 'split debug information (-gsplit-dwarf compile flag) and debug information in the gdb index format (--gdb-index)',
 )
 option(
+  'nvk-libounce-nx',
+  type : 'string',
+  value : '',
+  description : 'Absolute libounce-nx nx/ directory (include/ and lib/libounce-nx.a) for the native GPU backend',
+)
+option(
   'platforms',
   type : 'array',
   value : ['auto'],
   choices : [
-    'auto', 'x11', 'wayland', 'haiku', 'android', 'windows', 'macos',
+    'auto', 'x11', 'wayland', 'haiku', 'android', 'windows', 'macos', 'horizon',
   ],
   description : 'window systems to support. If this is set to `auto`, all ' +
                 'platforms applicable will be enabled.'
@@ -23,7 +29,7 @@ option(
   type : 'combo',
   value : 'auto',
   choices : [
-    'auto', 'x11', 'haiku', 'android', 'surfaceless',
+    'auto', 'x11', 'haiku', 'android', 'surfaceless', 'horizon',
   ],
   description : 'the window system EGL assumes for EGL_DEFAULT_DISPLAY',
 )
@@ -796,6 +802,15 @@ option(
   max : 11,
   value : 8,
   description : 'Minimum Windows version to support. Defaults to Windows 8.'
+)
+
+option(
+  'driconf-policy',
+  type : 'combo',
+  choices : ['full', 'defaults-only'],
+  value : 'full',
+  description : 'defaults-only preserves built-in option defaults and caches, ' +
+                'without per-option environment overrides or XML/static matching.'
 )
 
 option(

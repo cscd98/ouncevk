@@ -7480,6 +7480,12 @@ vtn_create_builder(const uint32_t *words, size_t word_count,
 {
    /* Initialize the vtn_builder object */
    struct vtn_builder *b = rzalloc(NULL, struct vtn_builder);
+   if (!b)
+      return NULL;
+
+   /* Header validation can log before the builder has its own copy of the
+    * options. The caller's options stay valid until this function returns. */
+   b->options = options;
 
    b->spirv = words;
    b->spirv_word_count = word_count;

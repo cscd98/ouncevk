@@ -54,6 +54,13 @@ typedef void *EGLNativeDisplayType;
 typedef void *EGLNativePixmapType;
 typedef void *EGLNativeWindowType;
 
+#elif defined(__SWITCH__)
+
+/* The Horizon native window is an NWindow. */
+typedef void               *EGLNativeDisplayType;
+typedef void               *EGLNativePixmapType;
+typedef struct NWindow     *EGLNativeWindowType;
+
 #elif defined(_WIN32) || defined(__VC32__) && !defined(__CYGWIN__) && !defined(__SCITECH_SNAP__) /* Win32 and WinCE */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN 1

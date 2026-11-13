@@ -7,7 +7,7 @@ use std::cmp::min;
 
 use compiler::bindings::*;
 use nak_bindings::*;
-use nvidia_headers::classes::{cla0c0, clc0c0, clc3c0, clc6c0, clcbc0, clcdc0};
+use nvidia_headers::classes::{cla0c0, clc0c0, clc3c0, clc6c0, clc7c0, clcbc0, clcdc0};
 
 use bitview::*;
 use paste::paste;
@@ -510,35 +510,52 @@ use qmd_2_2::Qmd2_2;
 mod qmd_3_0 {
     use crate::qmd::*;
     use nvidia_headers::classes::clc6c0::qmd as clc6c0;
+    use nvidia_headers::classes::clc7c0::qmd as clc7c0;
 
-    #[repr(transparent)]
-    pub struct Qmd3_0 {
-        qmd: [u32; 64],
+    // C7C0 uses a 256-byte QMD3.0.
+    // Public NVIDIA open-gpu-doc 9fdf5c4 classes/compute/clc{6,7}c0qmd.h
+    // gives the class-specific fields. The common writer fields currently
+    // have the same positions in both classes. C7C0 changes
+    // HW_ONLY_DEPENDENCE_COUNTER and adds occupancy and release fields.
+    // Separate class definitions prevent a future C7C0 change from silently
+    // using C6C0 positions.
+    // This file copies no NVIDIA definitions. Their notices remain in the
+    // imported nvidia_headers files. This macro does not select a shader ISA.
+    macro_rules! qmd_3_0_class {
+        ($name:ident, $class:ident) => {
+            #[repr(transparent)]
+            pub struct $name {
+                qmd: [u32; 64],
+            }
+
+            impl QMD for $name {
+                fn new() -> Self {
+                    let mut qmd = [0; 64];
+                    let mut bv = QMDBitView::new(&mut qmd);
+                    qmd_init!(bv, $class, QMDV03_00, 3, 0);
+                    set_field!(bv, $class, QMDV03_00, SM_GLOBAL_CACHING_ENABLE, true);
+                    Self { qmd }
+                }
+
+                qmd_impl_common!($class, QMDV03_00);
+
+                fn set_crs_size(&mut self, crs_size: u32) {
+                    assert!(crs_size == 0);
+                }
+
+                qmd_impl_set_cbuf!($class, QMDV03_00, NONE, SHIFTED4);
+                qmd_impl_set_prog_addr_64!($class, QMDV03_00, NONE);
+                qmd_impl_set_register_count!($class, QMDV03_00, REGISTER_COUNT_V);
+                qmd_impl_set_smem_size_bounded!($class, QMDV03_00);
+                qmd_impl_set_slm_size!($class, QMDV03_00, NONE);
+            }
+        };
     }
 
-    impl QMD for Qmd3_0 {
-        fn new() -> Self {
-            let mut qmd = [0; 64];
-            let mut bv = QMDBitView::new(&mut qmd);
-            qmd_init!(bv, clc6c0, QMDV03_00, 3, 0);
-            set_field!(bv, clc6c0, QMDV03_00, SM_GLOBAL_CACHING_ENABLE, true);
-            Self { qmd }
-        }
-
-        qmd_impl_common!(clc6c0, QMDV03_00);
-
-        fn set_crs_size(&mut self, crs_size: u32) {
-            assert!(crs_size == 0);
-        }
-
-        qmd_impl_set_cbuf!(clc6c0, QMDV03_00, NONE, SHIFTED4);
-        qmd_impl_set_prog_addr_64!(clc6c0, QMDV03_00, NONE);
-        qmd_impl_set_register_count!(clc6c0, QMDV03_00, REGISTER_COUNT_V);
-        qmd_impl_set_smem_size_bounded!(clc6c0, QMDV03_00);
-        qmd_impl_set_slm_size!(clc6c0, QMDV03_00, NONE);
-    }
+    qmd_3_0_class!(Qmd3_0A, clc6c0);
+    qmd_3_0_class!(Qmd3_0B, clc7c0);
 }
-use qmd_3_0::Qmd3_0;
+use qmd_3_0::{Qmd3_0A, Qmd3_0B};
 
 mod qmd_4_0 {
     use crate::qmd::*;
@@ -671,8 +688,10 @@ pub extern "C" fn nak_qmd_size_B(dev: &nv_device_info) -> u32 {
         size_of::<Qmd5_0>().try_into().unwrap()
     } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
         size_of::<Qmd4_0>().try_into().unwrap()
+    } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+        size_of::<Qmd3_0B>().try_into().unwrap()
     } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
-        size_of::<Qmd3_0>().try_into().unwrap()
+        size_of::<Qmd3_0A>().try_into().unwrap()
     } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
         size_of::<Qmd2_2>().try_into().unwrap()
     } else if dev.cls_compute >= clc0c0::PASCAL_COMPUTE_A {
@@ -712,8 +731,12 @@ pub extern "C" fn nak_fill_qmd(
             let qmd_out = qmd_out as *mut Qmd4_0;
             assert!(qmd_size == size_of_val(&*qmd_out));
             qmd_out.write(fill_qmd(dev, info, qmd_info));
+        } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+            let qmd_out = qmd_out as *mut Qmd3_0B;
+            assert!(qmd_size == size_of_val(&*qmd_out));
+            qmd_out.write(fill_qmd(dev, info, qmd_info));
         } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
-            let qmd_out = qmd_out as *mut Qmd3_0;
+            let qmd_out = qmd_out as *mut Qmd3_0A;
             assert!(qmd_size == size_of_val(&*qmd_out));
             qmd_out.write(fill_qmd(dev, info, qmd_info));
         } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
@@ -742,8 +765,10 @@ pub extern "C" fn nak_get_qmd_dispatch_size_layout(
         Qmd5_0::GLOBAL_SIZE_LAYOUT
     } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
         Qmd4_0::GLOBAL_SIZE_LAYOUT
+    } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+        Qmd3_0B::GLOBAL_SIZE_LAYOUT
     } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
-        Qmd3_0::GLOBAL_SIZE_LAYOUT
+        Qmd3_0A::GLOBAL_SIZE_LAYOUT
     } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
         Qmd2_2::GLOBAL_SIZE_LAYOUT
     } else if dev.cls_compute >= clc0c0::PASCAL_COMPUTE_A {
@@ -764,8 +789,10 @@ pub extern "C" fn nak_get_qmd_cbuf_desc_layout(
         Qmd5_0::cbuf_desc_layout(idx)
     } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
         Qmd4_0::cbuf_desc_layout(idx)
+    } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+        Qmd3_0B::cbuf_desc_layout(idx)
     } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
-        Qmd3_0::cbuf_desc_layout(idx)
+        Qmd3_0A::cbuf_desc_layout(idx)
     } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
         Qmd2_2::cbuf_desc_layout(idx)
     } else if dev.cls_compute >= clc0c0::PASCAL_COMPUTE_A {

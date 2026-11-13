@@ -1144,6 +1144,32 @@ class TreeAutomaton(object):
             new_opcodes.clear()
             process_new_states()
 
+    def op_table(self, op):
+        """Returns (rows, entries): the transition table of op for C.
+
+        A row holds the transitions for one combination of the filtered
+        states of all sources except the last, in itertools.product() order.
+        When rows is None, entries holds all rows. Otherwise entries holds
+        each different row one time, and rows gives the index of each row in
+        entries. Most rows of a large table are the same, so this makes the
+        largest table about 20 times smaller.
+        """
+        num_filtered = len(self.rep[op])
+        num_srcs = len(next(iter(self.table[op])))
+        entries = [self.table[op][indices] for indices in
+                   itertools.product(range(num_filtered), repeat=num_srcs)]
+
+        unique_rows = {}
+        rows = []
+        for start in range(0, len(entries), num_filtered):
+            row = tuple(entries[start:start + num_filtered])
+            rows.append(unique_rows.setdefault(row, len(unique_rows)))
+
+        if len(unique_rows) * num_filtered + len(rows) >= len(entries):
+            return None, entries
+        assert len(unique_rows) < (1 << 16)
+        return rows, [entry for row in unique_rows for entry in row]
+
 
 _algebraic_pass_template = mako.template.Template("""
 #include "nir.h"
@@ -1208,14 +1234,19 @@ static const struct per_op_table ${pass_name}_pass_op_table[nir_num_search_ops] 
 % endif
       <%
         num_filtered = len(automaton.rep[op])
+        rows, entries = automaton.op_table(op)
       %>
       .num_filtered_states = ${num_filtered},
+% if rows is not None:
+      .rows = (const uint16_t []) {
+      % for row in rows:
+         ${row},
+      % endfor
+      },
+% endif
       .table = (const uint16_t []) {
-      <%
-        num_srcs = len(next(iter(automaton.table[op])))
-      %>
-      % for indices in itertools.product(range(num_filtered), repeat=num_srcs):
-         ${automaton.table[op][indices]},
+      % for entry in entries:
+         ${entry},
       % endfor
       },
    },

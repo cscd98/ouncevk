@@ -26,6 +26,8 @@
 #include "vk_object.h"
 #include "vk_util.h"
 
+#include "c11/threads.h"
+#include "util/list.h"
 #include "util/simple_mtx.h"
 
 #ifdef __cplusplus
@@ -163,6 +165,15 @@ struct vk_pipeline_cache {
    simple_mtx_t lock;
 
    struct set *object_cache;
+
+   /** Protects compiles and is the mutex of compile_done */
+   mtx_t compile_lock;
+
+   /** Signaled when a compile in compiles ends */
+   cnd_t compile_done;
+
+   /** Compiles in progress, one for each key being compiled */
+   struct list_head compiles;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(vk_pipeline_cache, base, VkPipelineCache,
@@ -237,6 +248,41 @@ vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
                                 const void *key_data, size_t key_size,
                                 const struct vk_pipeline_cache_object_ops *ops,
                                 bool *cache_hit);
+
+/** Looks up an object, or claims the compile of a missing one
+ *
+ * The cache must not be NULL. Looks up the object as
+ * vk_pipeline_cache_lookup_object() does. When it is
+ * missing and another thread is compiling the same key, waits until that
+ * compile ends and looks again, so that two threads do not compile the same
+ * object. When it is missing and nobody is compiling it, records that this
+ * thread compiles it, sets *claimed and returns NULL. The caller then
+ * compiles the object, adds it with vk_pipeline_cache_add_object() and calls
+ * vk_pipeline_cache_end_compile(), or calls only vk_pipeline_cache_end_compile()
+ * if the compile fails.
+ *
+ * A thread that holds a claim must not wait for another thread's compile:
+ * two threads could each wait for the other. Pass may_wait = false when the
+ * caller already holds a claim. A missing object that another thread is
+ * compiling is then a miss, without a claim.
+ *
+ * *cache_hit is set only when the object was found without waiting.
+ */
+struct vk_pipeline_cache_object * MUST_CHECK
+vk_pipeline_cache_lookup_or_claim(struct vk_pipeline_cache *cache,
+                                  const void *key_data, size_t key_size,
+                                  const struct vk_pipeline_cache_object_ops *ops,
+                                  bool *cache_hit, bool may_wait,
+                                  bool *claimed);
+
+/** Ends a compile claimed with vk_pipeline_cache_lookup_or_claim()
+ *
+ * Wakes the threads waiting for it. Call it after adding the compiled object
+ * to the cache, or after the compile fails.
+ */
+void
+vk_pipeline_cache_end_compile(struct vk_pipeline_cache *cache,
+                              const void *key_data, size_t key_size);
 
 /** Adds an object to the pipeline cache
  *

@@ -124,7 +124,9 @@ driGetOptionsXml(const driOptionDescription *configOptions, unsigned numOptions)
  * For the option information to be available to external configuration tools
  * it must be a public symbol __driConfigOptions. It is also passed as a
  * parameter to driParseOptionInfo in order to avoid driver-independent code
- * depending on symbols in driver-specific code. */
+ * depending on symbols in driver-specific code. With
+ * driconf-policy=defaults-only, this function ignores per-option environment
+ * overrides. */
 void driParseOptionInfo(driOptionCache *info,
                         const driOptionDescription *configOptions,
                         unsigned numOptions);
@@ -152,7 +154,10 @@ typedef struct {
 /** \brief Initialize option cache from info and parse configuration files
  *
  * To be called in <driver>CreateContext. Fields in driConfigFileParseParams
- * select which device/application/engine sections apply. */
+ * select which device/application/engine sections apply. With
+ * driconf-policy=defaults-only, this function only creates an independently
+ * owned value cache. It does not match configuration sections or call shader
+ * callbacks. */
 void driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
                          const driConfigFileParseParams *params);
 /** \brief Destroy option info

@@ -5236,17 +5236,26 @@ should_print_nir(UNUSED nir_shader *shader)
 }
 #endif /* NDEBUG */
 
+/* Per-pass compile time, written to the file that NIR_PASS_TIMING names
+ * (nir_pass_timing.c). nir_pass_timing_begin returns 0 when it is off.
+ */
+uint64_t nir_pass_timing_begin(void);
+void nir_pass_timing_end(const char *name, uint64_t start_ns);
+void nir_pass_timing_report(const char *label);
+
 #define _PASS(pass, nir, do_pass)                                       \
    do {                                                                 \
       if (should_skip_nir(#pass)) {                                     \
          printf("skipping %s\n", #pass);                                \
          break;                                                         \
       }                                                                 \
+      const uint64_t _nir_pass_start = nir_pass_timing_begin();         \
       if (NIR_DEBUG(INVALIDATE_METADATA))                               \
          nir_metadata_invalidate(nir);                                  \
       else if (NIR_DEBUG(EXTENDED_VALIDATION))                          \
          nir_metadata_require_most(nir);                                \
-      do_pass if (NIR_DEBUG(CLONE))                                     \
+      do_pass nir_pass_timing_end(#pass, _nir_pass_start);              \
+      if (NIR_DEBUG(CLONE))                                             \
       {                                                                 \
          nir_shader *_clone = nir_shader_clone(ralloc_parent(nir), nir);\
          nir_shader_replace(nir, _clone);                               \
@@ -5489,6 +5498,7 @@ nir_def *nir_inline_function_impl(nir_builder *b,
                                   nir_def **params,
                                   struct hash_table *shader_var_remap);
 bool nir_inline_functions(nir_shader *shader);
+bool nir_inline_functions_into_entrypoints(nir_shader *shader);
 void nir_cleanup_functions(nir_shader *shader);
 bool nir_link_shader_functions(nir_shader *shader,
                                const nir_shader *link_shader);

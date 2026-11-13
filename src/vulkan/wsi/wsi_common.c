@@ -269,6 +269,12 @@ wsi_device_init(struct wsi_device *wsi,
       goto fail;
 #endif
 
+#ifdef VK_USE_PLATFORM_VI_NN
+   result = wsi_switch_init_wsi(wsi, alloc, pdevice);
+   if (result != VK_SUCCESS)
+      goto fail;
+#endif
+
 #ifndef VK_USE_PLATFORM_WIN32_KHR
    result = wsi_headless_init_wsi(wsi, alloc, pdevice);
    if (result != VK_SUCCESS)
@@ -357,6 +363,9 @@ wsi_device_finish(struct wsi_device *wsi,
 #endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    wsi_metal_finish_wsi(wsi, alloc);
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   wsi_switch_finish_wsi(wsi, alloc);
 #endif
 }
 
@@ -2219,6 +2228,14 @@ wsi_signal_semaphore_for_image(struct vk_device *device,
 
    vk_semaphore_reset_temporary(device, semaphore);
 
+   if (chain->create_acquire_sync) {
+      VkResult result = chain->create_acquire_sync(
+         (struct wsi_swapchain *)chain, image, VK_SYNC_FEATURE_GPU_WAIT,
+         &semaphore->temporary);
+      if (result != VK_ERROR_FEATURE_NOT_PRESENT)
+         return result;
+   }
+
 #ifdef HAVE_LIBDRM
    VkResult result = chain->image_info.explicit_sync ?
       wsi_create_sync_for_image_syncobj(chain, image,
@@ -2248,6 +2265,14 @@ wsi_signal_fence_for_image(struct vk_device *device,
    VK_FROM_HANDLE(vk_fence, fence, _fence);
 
    vk_fence_reset_temporary(device, fence);
+
+   if (chain->create_acquire_sync) {
+      VkResult result = chain->create_acquire_sync(
+         (struct wsi_swapchain *)chain, image, VK_SYNC_FEATURE_CPU_WAIT,
+         &fence->temporary);
+      if (result != VK_ERROR_FEATURE_NOT_PRESENT)
+         return result;
+   }
 
 #ifdef HAVE_LIBDRM
    VkResult result = chain->image_info.explicit_sync ?

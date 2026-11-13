@@ -363,6 +363,20 @@ util_vma_heap_get_max_free_continuous_size(struct util_vma_heap *heap)
    return max_size;
 }
 
+bool
+util_vma_heap_get_lowest_hole(struct util_vma_heap *heap,
+                              uint64_t *offset, uint64_t *size)
+{
+   /* The holes are sorted from the highest address to the lowest. */
+   if (list_is_empty(&heap->holes))
+      return false;
+   const struct util_vma_hole *hole =
+      list_last_entry(&heap->holes, struct util_vma_hole, link);
+   *offset = hole->offset;
+   *size = hole->size;
+   return true;
+}
+
 void
 util_vma_heap_print(struct util_vma_heap *heap, FILE *fp,
                     const char *tab, uint64_t total_size)

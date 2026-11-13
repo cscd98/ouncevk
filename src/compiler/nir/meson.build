@@ -100,6 +100,7 @@ if with_nir_headers_only
 else
   files_libnir += files(
   'nir.c',
+  'nir_pass_timing.c',
   'nir.h',
   'nir_builder.c',
   'nir_builder.h',

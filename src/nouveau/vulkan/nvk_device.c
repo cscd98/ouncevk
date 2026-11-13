@@ -169,8 +169,7 @@ static VkResult
 nvk_device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
 {
    struct nvk_device *dev = container_of(vk_dev, struct nvk_device, vk);
-   *timestamp = nvkmd_dev_get_gpu_timestamp(dev->nvkmd);
-   return VK_SUCCESS;
+   return nvkmd_dev_read_gpu_timestamp(dev->nvkmd, timestamp);
 }
 
 struct dispatch_table_builder {
@@ -261,7 +260,9 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->vk.command_buffer_ops = &nvk_cmd_buffer_ops;
 
       dev->vk.get_timestamp = nvk_device_get_timestamp;
+#ifndef __SWITCH__
       dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+#endif
 
       result = nvk_upload_queue_init(dev, &dev->upload);
       if (result != VK_SUCCESS)
@@ -277,6 +278,9 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
       nvkmd_mem_sync_map_to_gpu(dev->zero_page, 0, 0x1000);
       nvkmd_mem_unmap(dev->zero_page, 0);
 
+      /* On native, the arena commits the whole table at init (32 MiB for
+       * 2^20 image descriptors). See nvk_mem_arena_init.
+       */
       result = nvk_descriptor_table_init(dev, &dev->images,
                                          sizeof(struct nil_descriptor),
                                          1024, 1024 * 1024);

@@ -45,6 +45,30 @@ enum nvk_debug {
 
    /* Disable image compression */
    NVK_DEBUG_NO_COMPRESSION = 1ull << 9,
+
+   /* Log vk_error*() messages.
+    *
+    * A release build drops them unless the instance enables debug logging.
+    */
+   NVK_DEBUG_ERRORS = 1ull << 10,
+
+   /* Flush whole mem arenas on submit, not only their dirty ranges */
+   NVK_DEBUG_FULL_ARENA_FLUSH = 1ull << 11,
+
+   /* Flush whole command buffer mems on end. */
+   NVK_DEBUG_FULL_CMD_FLUSH = 1ull << 12,
+
+   /* Run copies through vk_meta instead of the copy engine */
+   NVK_DEBUG_META_COPY = 1ull << 13,
+
+   /* Send one copy engine launch for each line, not one for each copy */
+   NVK_DEBUG_SPLIT_CE_COPY = 1ull << 14,
+
+   /* Do not promote block-linear sector fetches on texture headers */
+   NVK_DEBUG_NO_SECTOR_PROMOTION = 1ull << 15,
+
+   /* Upload the whole push descriptor set again on every draw and dispatch */
+   NVK_DEBUG_FULL_PUSH_DESC = 1ull << 16,
 };
 
 enum nvk_experimental {

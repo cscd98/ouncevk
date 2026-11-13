@@ -190,7 +190,13 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
     * dEQP-VK.subgroups.vote.frag_helper.subgroupallequal_bvec2_fragment will
     * occasionally fail.
     */
-   if (pdev->info.cls_eng3d >= MAXWELL_B) {
+
+   /* SET_FALCON04 sends these writes through the FECS falcon. An
+    * unprivileged SoC channel cannot drive that falcon.
+    */
+   const bool priv_reg_ok = pdev->info.type != NV_DEVICE_TYPE_SOC;
+
+   if (pdev->info.cls_eng3d >= MAXWELL_B && priv_reg_ok) {
       unsigned reg = get_sm_disp_ctrl_reg(&pdev->info);
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_PRIV_REG));
       P_INLINE_DATA(p, 0);
@@ -244,7 +250,7 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
     *
     * This clears bit 14 of gr_gpcs_tpcs_sms_hww_warp_esr_report_mask
     */
-   if (pdev->info.cls_eng3d >= MAXWELL_B) {
+   if (pdev->info.cls_eng3d >= MAXWELL_B && priv_reg_ok) {
       unsigned reg = get_sms_hww_warp_esp_report_mask_reg(&pdev->info);
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_PRIV_REG));
       P_INLINE_DATA(p, 0);
@@ -5966,6 +5972,7 @@ nvk_cmd_begin_cond_render_copy_engine(struct nvk_cmd_buffer *cmd,
        */
       assert(cmd->cond_render_mem->mem->size_B > 32);
       memset(cmd->cond_render_mem->mem->map, 0x00, 32);
+      nvk_cmd_mem_add_used(cmd->cond_render_mem, 32);
    }
    const uint64_t tmp_addr = cmd->cond_render_mem->mem->va->addr;
 

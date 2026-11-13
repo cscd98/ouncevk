@@ -19,6 +19,12 @@ project(
 
 project_version = meson.project_version()
 
+# Horizon builds use NVK's native Switch 2 backend.
+with_nvk_native_headless = host_machine.system() == 'horizon'
+if with_nvk_native_headless
+  add_project_arguments('-DNVK_NATIVE_HEADLESS', language : ['c', 'cpp'])
+endif
+
 if host_machine.system() == 'darwin'
   add_languages('objc', native : false)
   libname_prefix = 'lib'
@@ -475,10 +481,18 @@ if _platforms.contains('auto')
     _platforms = ['windows']
   elif host_machine.system() == 'darwin'
     _platforms = ['x11', 'macos']
+  elif host_machine.system() == 'horizon'
+    _platforms = ['horizon']
   else
     error('Unknown OS @0@. Please pass -Dplatforms to set platforms. Patches gladly accepted to fix this.'.format(
           host_machine.system()))
   endif
+endif
+
+# Vulkan's VI2 WSI follows the host system, not this list. 'horizon' only
+# selects the Horizon EGL driver (src/egl/drivers/nwindow).
+if with_nvk_native_headless and _platforms.length() != 0 and _platforms != ['horizon']
+  error('native-headless supports -Dplatforms=horizon (EGL) or none')
 endif
 
 with_platform_android = _platforms.contains('android')
@@ -487,6 +501,7 @@ with_platform_wayland = _platforms.contains('wayland')
 with_platform_haiku = _platforms.contains('haiku')
 with_platform_windows = _platforms.contains('windows')
 with_platform_macos = _platforms.contains('macos')
+with_platform_horizon = _platforms.contains('horizon')
 
 with_gfxstream_emulated_android = with_gfxstream_vk and with_platform_android and host_machine.system() == 'linux'
 if with_gfxstream_emulated_android
@@ -559,7 +574,7 @@ with_xlib_lease = get_option('xlib-lease') \
   .allowed()
 
 with_egl = get_option('egl') \
-  .require(with_platform_windows or with_platform_haiku or with_dri or with_platform_android, error_message : 'EGL requires DRI, Haiku, Windows or Android') \
+  .require(with_platform_windows or with_platform_haiku or with_dri or with_platform_android or with_platform_horizon, error_message : 'EGL requires DRI, Haiku, Windows, Android or Horizon') \
   .require(with_glx != 'xlib', error_message :'EGL requires DRI, but GLX is being built with xlib support') \
   .disable_auto_if(with_platform_haiku) \
   .allowed()
@@ -569,13 +584,16 @@ if with_gbm
 endif
 
 if with_egl
-  _platforms += 'surfaceless'
-  if with_gbm and not with_platform_android
-    _platforms += 'drm'
+  # Horizon has no DRI.
+  if not with_platform_horizon
+    _platforms += 'surfaceless'
+    if with_gbm and not with_platform_android
+      _platforms += 'drm'
+    endif
   endif
 
   # All the other platforms can be detected and cannot reach the native platform code
-  _undetectable_platforms = ['x11', 'haiku', 'android', 'surfaceless']
+  _undetectable_platforms = ['x11', 'haiku', 'android', 'surfaceless', 'horizon']
 
   # Don't enforce the native platform if none of the undetectable platforms are enabled
   _undetectable_platforms_enabled = []
@@ -1846,8 +1864,14 @@ else
                          required : with_expat)
 endif
 
+driconf_defaults_only = get_option('driconf-policy') == 'defaults-only'
+if driconf_defaults_only and get_option('xmlconfig').enabled()
+  error('driconf-policy=defaults-only conflicts with xmlconfig=enabled')
+endif
+
 # We don't require expat on Android or Windows
 use_xmlconfig = get_option('xmlconfig') \
+  .disable_auto_if(driconf_defaults_only) \
   .require(not (with_platform_android or with_platform_windows),
            error_message : 'xmlconfig not available on Android or Windows') \
   .require(dep_expat.found(),
@@ -2083,10 +2107,15 @@ endif
 with_spirv_tools = get_option('spirv-tools') \
     .enable_if(with_clc, error_message : 'CLC requires SPIRV-Tools')
 
+_spirv_tools_min_version = '>= 2024.1'
+if dep_llvm.found() and not dep_llvm.version().version_compare('>= 17.0')
+  _spirv_tools_min_version = '>= 2023.1'
+endif
+
 dep_spirv_tools = dependency(
   'SPIRV-Tools',
   required : with_spirv_tools,
-  version : '>= 2024.1',
+  version : _spirv_tools_min_version,
 )
 if dep_spirv_tools.found()
   pre_args += '-DHAVE_SPIRV_TOOLS'
@@ -2147,7 +2176,7 @@ if dep_elf.found()
   pre_args += '-DUSE_LIBELF'
 elif with_gallium_radeonsi and with_gfx_compute
   error('Gallium driver radeonsi requires libelf')
-elif with_nouveau_vk
+elif with_nouveau_vk and host_machine.system() != 'horizon'
   error('NVK requires libelf')
 endif
 

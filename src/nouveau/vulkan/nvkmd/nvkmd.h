@@ -6,6 +6,7 @@
 #define NVKMD_H 1
 
 #include "nv_device_info.h"
+#include "util/detect_os.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
@@ -56,6 +57,21 @@ enum nvkmd_mem_flags {
 
    /** This memory object has coherent CPU maps */
    NVKMD_MEM_COHERENT   = 1 << 5,
+
+   /** GPU accesses to this memory must bypass the GPU cache hierarchy */
+   NVKMD_MEM_GPU_UNCACHED = 1 << 6,
+
+   /** Memory backs a compressed image */
+   NVKMD_MEM_COMPRESSED = 1 << 7,
+
+   /** CPU maps of this memory bypass the CPU cache */
+   NVKMD_MEM_CPU_UNCACHED = 1 << 8,
+
+   /** Application memory of a HOST_CACHED, non-coherent type. CPU maps are
+    *  cached. The application flushes and invalidates them. Backends can
+    *  put this memory in CPU-cached memory.
+    */
+   NVKMD_MEM_CPU_CACHED = 1 << 9,
 };
 
 #define NVKMD_MEM_PLACEMENT_FLAGS \
@@ -121,12 +137,19 @@ struct nvkmd_info {
    bool has_map_fixed;
    bool has_overmap;
    bool has_compression;
+   bool has_sparse;
 };
 
 struct nvkmd_pdev_ops {
    void (*destroy)(struct nvkmd_pdev *pdev);
 
    uint64_t (*get_vram_used)(struct nvkmd_pdev *pdev);
+
+   /* Optional. Returns the bytes of the bounded system-memory heap that
+    * later allocations can still use. Without it, the estimate is the
+    * whole size of the heap.
+    */
+   uint64_t (*get_sysmem_available)(struct nvkmd_pdev *pdev);
 
    int (*get_drm_primary_fd)(struct nvkmd_pdev *pdev);
 
@@ -142,6 +165,30 @@ struct nvkmd_pdev {
 
    struct nv_device_info dev_info;
    struct nvkmd_info kmd_info;
+
+   /* Size of a backend-owned, bounded GPU-visible system-memory arena. Zero
+    * means that the ordinary OS memory query applies. Native headless
+    * discovery sets this only after it maps its retained arena and the
+    * arena is ready.
+    */
+   uint64_t bounded_sysmem_size_B;
+   /* Bounded native memory can also have these types:
+    * - has_cached_memory: GPU-cacheable memory that the CPU never maps
+    *   (a DEVICE_LOCAL-only type).
+    * - has_readback_memory: CPU-cached readback memory (HOST_CACHED,
+    *   non-coherent).
+    * All types share the one bounded heap.
+    */
+   bool has_cached_memory, has_readback_memory;
+   /* Service-owned display targets that the CPU cannot map. When set,
+    * advertise a device-local-only memory type for private WSI imports.
+    */
+   bool has_borrowed_display_targets;
+   /* import_host_ptr is supported (VK_EXT_external_memory_host). Imported
+    * memory has the HOST_CACHED, non-coherent memory types. */
+   bool has_host_ptr_import;
+   /* The alignment of an imported host pointer and size. */
+   uint32_t host_ptr_align_B;
 
    /** Device-wide GPU memory bind alignment
     *
@@ -163,6 +210,9 @@ struct nvkmd_dev_ops {
 
    uint64_t (*get_gpu_timestamp)(struct nvkmd_dev *dev);
 
+   /* Optional form of get_gpu_timestamp that returns a VkResult. */
+   VkResult (*read_gpu_timestamp)(struct nvkmd_dev *dev, uint64_t *timestamp);
+
    int (*get_drm_fd)(struct nvkmd_dev *dev);
 
    VkResult (*alloc_mem)(struct nvkmd_dev *dev,
@@ -181,6 +231,18 @@ struct nvkmd_dev_ops {
    VkResult (*import_dma_buf)(struct nvkmd_dev *dev,
                               struct vk_object_base *log_obj,
                               int fd, struct nvkmd_mem **mem_out);
+
+   /* Optional: imports [host_ptr, +size_B) of the process's own memory,
+    * which stays the program's. Returns VK_ERROR_INVALID_EXTERNAL_HANDLE
+    * for memory that cannot be imported. */
+   VkResult (*import_host_ptr)(struct nvkmd_dev *dev,
+                               struct vk_object_base *log_obj,
+                               void *host_ptr, uint64_t size_B,
+                               enum nvkmd_mem_flags flags,
+                               struct nvkmd_mem **mem_out);
+
+   /* Optional: whether the page at host_ptr can be imported. */
+   bool (*host_ptr_importable)(struct nvkmd_dev *dev, const void *host_ptr);
 
    VkResult (*alloc_va)(struct nvkmd_dev *dev,
                         struct vk_object_base *log_obj,
@@ -237,6 +299,23 @@ struct nvkmd_mem_ops {
 
    /** Handle to use for NVK_DEBUG_VM logging */
    uint32_t (*log_handle)(struct nvkmd_mem *mem);
+
+   /* A dedicated image can use an already mapped VA directly if the backend
+    * confirms its kind, tile metadata and covered range.
+    */
+   bool (*can_bind_image_direct)(struct nvkmd_mem *mem,
+                                 uint8_t pte_kind, uint16_t tile_mode,
+                                 uint64_t offset_B, uint64_t size_B);
+
+   /* Optional. Use this when the mapping of this memory does not have the
+    * PTE kind of an image. The backend maps the same memory again with that
+    * kind. It returns the GPU address of the image in that mapping.
+    * offset_B and size_B give the range of the image plane in this memory.
+    */
+   VkResult (*bind_image_kind)(struct nvkmd_mem *mem,
+                               uint8_t pte_kind, uint16_t tile_mode,
+                               uint64_t offset_B, uint64_t size_B,
+                               uint64_t *addr_out);
 };
 
 struct nvkmd_mem {
@@ -261,12 +340,24 @@ struct nvkmd_mem {
    void *client_map;
 };
 
+static inline bool
+nvkmd_mem_is_cpu_cacheable(const struct nvkmd_mem *mem)
+{
+   return !(mem->flags & (NVKMD_MEM_COHERENT | NVKMD_MEM_CPU_UNCACHED));
+}
+
 void nvkmd_mem_init(struct nvkmd_dev *dev,
                     struct nvkmd_mem *mem,
                     const struct nvkmd_mem_ops *ops,
                     enum nvkmd_mem_flags flags,
                     uint64_t size_B,
                     uint32_t bind_align_B);
+
+/* Adds an imported memory wrapper that a backend made to the device list.
+ * Ordinary allocation uses the same list. Call this one time, before the
+ * first unref of the wrapper. nvkmd_mem_unref removes it from the list.
+ */
+void nvkmd_dev_add_mem(struct nvkmd_dev *dev, struct nvkmd_mem *mem);
 
 struct nvkmd_va_ops {
    void (*free)(struct nvkmd_va *va);
@@ -348,6 +439,14 @@ struct nvkmd_ctx_ops {
    /* Implies flush() */
    VkResult (*sync)(struct nvkmd_ctx *ctx,
                     struct vk_object_base *log_obj);
+
+   /* Optional. The pushbuffer words that set this context's complete
+    * channel state (its queue's context init and current pools). A backend
+    * whose contexts share one hardware channel replays them before work of
+    * this context when another context has set the channel state since. A
+    * copy of the words is kept. */
+   VkResult (*set_state_replay)(struct nvkmd_ctx *ctx,
+                                const uint32_t *words, uint32_t word_count);
 };
 
 struct nvkmd_ctx {
@@ -384,6 +483,13 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
                               enum nvk_debug debug_flags,
                               struct nvkmd_pdev **pdev_out);
 
+#if DETECT_OS_HORIZON
+VkResult MUST_CHECK
+nvkmd_try_create_pdev(struct vk_object_base *log_obj,
+                      enum nvk_debug debug_flags,
+                      struct nvkmd_pdev **pdev_out);
+#endif
+
 static inline void
 nvkmd_pdev_destroy(struct nvkmd_pdev *pdev)
 {
@@ -394,6 +500,14 @@ static inline uint64_t
 nvkmd_pdev_get_vram_used(struct nvkmd_pdev *pdev)
 {
    return pdev->ops->get_vram_used(pdev);
+}
+
+static inline uint64_t
+nvkmd_pdev_get_sysmem_available(struct nvkmd_pdev *pdev)
+{
+   if (pdev->ops->get_sysmem_available == NULL)
+      return pdev->bounded_sysmem_size_B;
+   return pdev->ops->get_sysmem_available(pdev);
 }
 
 static inline int
@@ -423,6 +537,15 @@ static inline uint64_t
 nvkmd_dev_get_gpu_timestamp(struct nvkmd_dev *dev)
 {
    return dev->ops->get_gpu_timestamp(dev);
+}
+
+static inline VkResult
+nvkmd_dev_read_gpu_timestamp(struct nvkmd_dev *dev, uint64_t *timestamp)
+{
+   if (dev->ops->read_gpu_timestamp)
+      return dev->ops->read_gpu_timestamp(dev, timestamp);
+   *timestamp = dev->ops->get_gpu_timestamp(dev);
+   return VK_SUCCESS;
 }
 
 static inline int
@@ -462,6 +585,20 @@ VkResult MUST_CHECK
 nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
                          struct vk_object_base *log_obj,
                          int fd, struct nvkmd_mem **mem_out);
+
+VkResult MUST_CHECK
+nvkmd_dev_import_host_ptr(struct nvkmd_dev *dev,
+                          struct vk_object_base *log_obj,
+                          void *host_ptr, uint64_t size_B,
+                          enum nvkmd_mem_flags flags,
+                          struct nvkmd_mem **mem_out);
+
+static inline bool
+nvkmd_dev_host_ptr_importable(struct nvkmd_dev *dev, const void *host_ptr)
+{
+   return dev->ops->host_ptr_importable != NULL &&
+          dev->ops->host_ptr_importable(dev, host_ptr);
+}
 
 struct nvkmd_mem *
 nvkmd_dev_lookup_mem_by_va(struct nvkmd_dev *dev,
@@ -622,6 +759,15 @@ nvkmd_ctx_sync(struct nvkmd_ctx *ctx,
                struct vk_object_base *log_obj)
 {
    return ctx->ops->sync(ctx, log_obj);
+}
+
+static inline VkResult MUST_CHECK
+nvkmd_ctx_set_state_replay(struct nvkmd_ctx *ctx,
+                           const uint32_t *words, uint32_t word_count)
+{
+   if (!ctx->ops->set_state_replay)
+      return VK_SUCCESS;
+   return ctx->ops->set_state_replay(ctx, words, word_count);
 }
 
 #endif /* NVKMD_H */

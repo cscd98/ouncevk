@@ -64,6 +64,13 @@ void
 mesa_log_v(enum mesa_log_level, const char *tag, const char *format,
             va_list va);
 
+#ifdef NVK_NATIVE_HEADLESS
+/* Logs a native message that is already formatted. flags keeps the
+ * rejection and truncation flags from that earlier formatting. */
+void mesa_log_native_message(enum mesa_log_level level, const char *tag,
+                             const char *message, unsigned flags);
+#endif
+
 void
 _mesa_log(const char *fmtString, ...) PRINTFLIKE(1, 2);
 

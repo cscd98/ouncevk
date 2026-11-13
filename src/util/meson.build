@@ -40,6 +40,7 @@ files_mesa_util = files(
   'disk_cache.h',
   'disk_cache_os.c',
   'disk_cache_os.h',
+  'disk_cache_store.h',
   'double.c',
   'double.h',
   'enum_operators.h',
@@ -186,6 +187,17 @@ files_mesa_util = files(
 
 libmesa_util_links = []
 
+if host_machine.system() == 'horizon'
+  # The Horizon runtime glue: the clock and thread hooks on libounce, and the
+  # POSIX functions newlib does not have.
+  files_mesa_util += files(
+    'disk_cache_store.c',
+    'horizon/posix_memalign.c',
+    'horizon/posix_shims.c',
+    'horizon/runtime_hooks.c',
+  )
+endif
+
 if host_machine.cpu_family() == 'aarch64' and cc.get_id() != 'msvc'
   files_mesa_util += files('cache_ops_aarch64.c')
 elif host_machine.cpu_family() in ['x86', 'x86_64'] and cc.get_id() != 'msvc'
@@ -269,14 +281,16 @@ files_xmlconfig = files(
   'xmlconfig.h',
 )
 
-files_xmlconfig += custom_target(
-  'driconf_static.h',
-  input: ['driconf_static.py'] + files_drirc,
-  output: 'driconf_static.h',
-  command: [
-    prog_python, '@INPUT@', '@OUTPUT@',
-  ],
-)
+if not driconf_defaults_only
+  files_xmlconfig += custom_target(
+    'driconf_static.h',
+    input: ['driconf_static.py'] + files_drirc,
+    output: 'driconf_static.h',
+    command: [
+      prog_python, '@INPUT@', '@OUTPUT@',
+    ],
+  )
+endif
 
 format_srgb = custom_target(
   'format_srgb',
@@ -403,7 +417,9 @@ xmlconfig_deps = []
 if use_xmlconfig
   xmlconfig_deps += dep_expat
 endif
-xmlconfig_deps += dep_regex
+if not driconf_defaults_only
+  xmlconfig_deps += dep_regex
+endif
 
 c_xmlconfig_arg = '-DWITH_XMLCONFIG=@0@'.format(use_xmlconfig.to_int())
 
@@ -415,6 +431,7 @@ _libxmlconfig = static_library(
     c_msvc_compat_args,
     soong_compat_c_args,
     c_xmlconfig_arg,
+    '-DDRI_CONF_DEFAULTS_ONLY=@0@'.format(driconf_defaults_only.to_int()),
     '-DSYSCONFDIR="@0@"'.format(
       join_paths(get_option('prefix'), get_option('sysconfdir'))
     ),
@@ -448,7 +465,9 @@ idep_parson = declare_dependency(
 if with_tests
   # DRI_CONF macros use designated initializers (required for union
   # initializaiton), so we need c++2a since gtest forces us to use c++
-  if host_machine.system() != 'windows' and cpp.has_argument('-std=c++2a')
+  # These tests need environment and configuration overrides, which
+  # defaults-only does not support.
+  if not driconf_defaults_only and host_machine.system() != 'windows' and cpp.has_argument('-std=c++2a')
     test('xmlconfig',
       executable('xmlconfig_test',
         files('tests/xmlconfig.cpp'),

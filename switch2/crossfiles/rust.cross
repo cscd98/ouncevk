@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+#
+# Second Meson cross file for the Horizon build: Rust and bindgen.
+# Use it after horizon.cross. The rustc wrapper selects the
+# aarch64-switch-horizon target and its prebuilt sysroot.
+
+[binaries]
+rust = ['/work/switch2/toolchain/rust/rustc-wrapper.sh']
+bindgen = 'bindgen'
+
+[properties]
+bindgen_clang_arguments = [
+    '--target=aarch64-none-elf',
+    '-isystem', '/opt/devkitpro/devkitA64/aarch64-none-elf/include',
+    '-isystem', '/ounce-nx/include',
+    '-isystem', '/ounce-nx/external/bsd/include',
+    '-D__SWITCH__',
+    '-D__SWITCH2__',
+    '-D_GNU_SOURCE',
+  ]

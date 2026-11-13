@@ -52,6 +52,10 @@ u_printf_info *u_printf_deserialize_info(void *mem_ctx,
 uint32_t u_printf_hash(const u_printf_info *info);
 
 void u_printf_singleton_init_or_ref(void);
+/* Returns true when the singleton exists and has its table. Callers that
+ * serialize startup themselves can check it after init_or_ref. A return from
+ * init_or_ref alone does not show that the allocation succeeded. */
+bool u_printf_singleton_is_ready(void);
 void u_printf_singleton_decref(void);
 void u_printf_singleton_add(const u_printf_info *info, unsigned count);
 void u_printf_singleton_add_serialized(const void *data, size_t data_size);

@@ -16,7 +16,9 @@
 #include "nvk_shader.h"
 #include "nvk_wsi.h"
 #include "nvkmd/nvkmd.h"
+#ifndef __SWITCH__
 #include "nvkmd/nouveau/nvkmd_nouveau.h"
+#endif
 #include "git_sha1.h"
 #include "util/detect_os.h"
 #include "util/disk_cache.h"
@@ -31,7 +33,9 @@
 #include "vk_shader_module.h"
 #include "vulkan/wsi/wsi_common.h"
 
-#include <sys/sysmacros.h>
+#ifndef __SWITCH__
+#include <sys/sysmacros.h> /* absent on Horizon */
+#endif
 
 #include "nv_push.h"
 #include "cl90c0.h"
@@ -58,6 +62,12 @@
 #include "clcdc0.h"
 #include "clce97.h"
 
+static bool
+nvk_supports_host_image_copy(const struct nv_device_info *info)
+{
+   return info->cls_eng3d >= TURING_A || info->type == NV_DEVICE_TYPE_SOC;
+}
+
 static uint32_t
 nvk_get_vk_version(const struct nv_device_info *info)
 {
@@ -74,10 +84,8 @@ nvk_get_vk_version(const struct nv_device_info *info)
    if (info->cls_eng3d < MAXWELL_A)
       return VK_MAKE_VERSION(1, 2, VK_HEADER_VERSION);
 
-   /* Vulkan 1.4 requires hostImageCopy which is currently only supported on
-    * Turing+.
-    */
-   if (info->cls_eng3d < TURING_A)
+   /* Vulkan 1.4 requires hostImageCopy */
+   if (!nvk_supports_host_image_copy(info))
       return VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION);
 
    return VK_MAKE_VERSION(1, 4, VK_HEADER_VERSION);
@@ -202,7 +210,9 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_storage_buffer_storage_class = true,
 #ifdef NVK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
+#ifndef NVK_NATIVE_HEADLESS
       .KHR_swapchain_maintenance1 = true,
+#endif
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
@@ -248,7 +258,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_graphics_pipeline_library = true,
       .EXT_hdr_metadata = true,
       .EXT_host_query_reset = true,
-      .EXT_host_image_copy = info->cls_eng3d >= TURING_A,
+      .EXT_host_image_copy = nvk_supports_host_image_copy(info),
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = true,
@@ -295,7 +305,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_shader_viewport_index_layer = info->cls_eng3d >= MAXWELL_B,
       .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_subgroup_size_control = true,
-#ifdef NVK_USE_WSI_PLATFORM
+#if defined(NVK_USE_WSI_PLATFORM) && !defined(NVK_NATIVE_HEADLESS)
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
@@ -321,8 +331,10 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .NV_shader_atomic_float16_vector = info->cls_eng3d >= TURING_A,
       .NV_shader_sm_builtins = true,
       .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
+#ifndef __SWITCH__
       .NVX_binary_import = info->cls_eng3d >= MAXWELL_A &&
          instance->experimental_flags & NVK_EXPERIMENTAL_DLSS,
+#endif
       .VALVE_mutable_descriptor_type = true,
    };
 }
@@ -330,6 +342,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
 static void
 nvk_get_device_features(const struct nv_device_info *info,
                         const struct vk_device_extension_table *supported_extensions,
+                        bool has_sparse,
                         struct vk_features *features)
 {
    /* TU11x uses the same shader model as other Turing but don't support the same features. */
@@ -381,14 +394,14 @@ nvk_get_device_features(const struct nv_device_info *info,
       .shaderInt16 = true,
       .shaderResourceResidency = info->cls_eng3d >= VOLTA_A,
       .shaderResourceMinLod = info->cls_eng3d >= VOLTA_A,
-      .sparseBinding = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency2Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency4Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidency8Samples = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyAliased = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyBuffer = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyImage2D = info->cls_eng3d >= MAXWELL_B,
-      .sparseResidencyImage3D = info->cls_eng3d >= MAXWELL_B,
+      .sparseBinding = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidency2Samples = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidency4Samples = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidency8Samples = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidencyAliased = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidencyBuffer = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidencyImage2D = has_sparse && info->cls_eng3d >= MAXWELL_B,
+      .sparseResidencyImage3D = has_sparse && info->cls_eng3d >= MAXWELL_B,
       .variableMultisampleRate = true,
       .inheritedQueries = true,
 
@@ -488,7 +501,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       .maintenance5 = true,
       .maintenance6 = true,
       .pipelineRobustness = true,
-      .hostImageCopy = info->cls_eng3d >= TURING_A,
+      .hostImageCopy = nvk_supports_host_image_copy(info),
       .pushDescriptor = true,
 
       /* VK_KHR_copy_memory_indirect */
@@ -684,7 +697,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_EXT_image_sliced_view_of_3d */
       .imageSlicedViewOf3D = true,
 
-#ifdef NVK_USE_WSI_PLATFORM
+#if defined(NVK_USE_WSI_PLATFORM) && !defined(NVK_NATIVE_HEADLESS)
       /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
@@ -756,7 +769,7 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_EXT_shader_image_atomic_int64 */
       .shaderImageInt64Atomics = info->cls_eng3d >= KEPLER_B,
-      .sparseImageInt64Atomics = info->cls_eng3d >= MAXWELL_A,
+      .sparseImageInt64Atomics = has_sparse && info->cls_eng3d >= MAXWELL_A,
 
       /* VK_EXT_shader_module_identifier */
       .shaderModuleIdentifier = true,
@@ -1475,6 +1488,15 @@ nvk_get_sysmem_heap_available(struct nvk_physical_device *pdev)
    return ROUND_DOWN_TO(sysmem_size_B, 1 << 20);
 }
 
+/* For the bounded heap of a native backend, the backend reports the
+ * available size.
+ */
+static uint64_t
+nvk_get_bounded_sysmem_heap_available(struct nvk_physical_device *pdev)
+{
+   return nvkmd_pdev_get_sysmem_available(pdev->nvkmd);
+}
+
 static uint64_t
 nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
 {
@@ -1485,19 +1507,13 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
    return pdev->info.vram_size_B - used;
 }
 
-VkResult
-nvk_create_drm_physical_device(struct vk_instance *_instance,
-                               struct _drmDevice *drm_device,
-                               struct vk_physical_device **pdev_out)
+static VkResult
+nvk_physical_device_create(struct nvk_instance *instance,
+                           struct nvkmd_pdev *nvkmd,
+                           struct vk_physical_device **pdev_out)
 {
-   struct nvk_instance *instance = (struct nvk_instance *)_instance;
    VkResult result;
-
-   struct nvkmd_pdev *nvkmd;
-   result = nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
-                                          instance->debug_flags, &nvkmd);
-   if (result != VK_SUCCESS)
-      return result;
+   const bool bounded_native = nvkmd->bounded_sysmem_size_B != 0;
 
    /* We don't support anything pre-Kepler */
    if (nvkmd->dev_info.cls_eng3d < KEPLER_A) {
@@ -1505,7 +1521,7 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_nvkmd;
    }
 
-   if (!nvk_is_conformant(&nvkmd->dev_info) &&
+   if (!bounded_native && !nvk_is_conformant(&nvkmd->dev_info) &&
        !debug_get_bool_option("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", false)) {
 #ifdef NDEBUG
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -1544,11 +1560,426 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_features supported_features;
    nvk_get_device_features(&nvkmd->dev_info, &supported_extensions,
-                           &supported_features);
+                           nvkmd->kmd_info.has_sparse, &supported_features);
 
    struct vk_properties properties;
    nvk_get_device_properties(instance, &nvkmd->dev_info, &properties);
 
+   /* The native backend is experimental. The ordinary NVK tables cover more
+    * than the commands that are tested on the native backend. Advertise an
+    * optional feature only when tests exercise its native path.
+    */
+   if (bounded_native) {
+      /* The NVK tables. Tested entries are copied from them. */
+      const struct vk_device_extension_table nvk_extensions =
+         supported_extensions;
+      const struct vk_features nvk_features = supported_features;
+      memset(&supported_extensions, 0, sizeof(supported_extensions));
+#ifdef VK_USE_PLATFORM_VI_NN
+      supported_extensions.KHR_swapchain = true;
+#endif
+      /* Timelines are emulated on the native syncobj (DEFERRED submit
+       * mode).
+       */
+      supported_extensions.KHR_timeline_semaphore = true;
+      memset(&supported_features, 0, sizeof(supported_features));
+      /* The NVK Ampere sampler descriptor path programs anisotropic
+       * filtering.
+       */
+      supported_features.samplerAnisotropy = true;
+      /* Core shader features: 64-bit and 16-bit integers, doubles, and
+       * dynamically indexed storage buffer arrays.
+       */
+      supported_features.shaderInt64 = true;
+      supported_features.shaderInt16 = true;
+      supported_features.shaderFloat64 = true;
+      supported_features.shaderStorageBufferArrayDynamicIndexing = true;
+      /* Graphics features. */
+      supported_features.geometryShader = true;
+      supported_features.tessellationShader = true;
+      supported_features.multiDrawIndirect = true;
+      supported_features.drawIndirectFirstInstance = true;
+      supported_features.independentBlend = true;
+      supported_features.logicOp = true;
+      supported_features.fillModeNonSolid = true;
+      supported_features.wideLines = true;
+      /* Vulkan 1.1: the required multiview feature and basic subgroup
+       * operations in compute. The rest of 1.1 is API-level NVK
+       * functionality.
+       */
+      supported_features.multiview = true;
+      supported_features.timelineSemaphore = true;
+
+      /* Vulkan 1.2 and 1.3 features, copied from the NVK report. There are
+       * two groups:
+       * - Features with native tests: buffer device address, descriptor
+       *   indexing (non-uniform, partially bound, update after bind),
+       *   8-bit and 16-bit storage, int8, int16 and float16 arithmetic,
+       *   scalar layout, the memory model, zero-initialized workgroup
+       *   memory, inline uniform blocks, subgroup size control with full
+       *   subgroups, dynamic rendering, synchronization2 and
+       *   vkQueueSubmit2, demote to helper, draw indirect count and host
+       *   query reset.
+       * - API and compiler level NVK functionality that the 1.2 and 1.3
+       *   core requires: the rest of descriptor indexing, imageless
+       *   framebuffers, separate depth/stencil layouts, standard uniform
+       *   layout, subgroup extended types, terminate invocation, integer
+       *   dot product, private data, pipeline creation cache control,
+       *   robust image access, maintenance4 and output layer.
+       */
+#define NATIVE_FEATURE(name) supported_features.name = nvk_features.name
+#define NATIVE_EXTENSION(name) supported_extensions.name = nvk_extensions.name
+      NATIVE_FEATURE(storageBuffer16BitAccess);
+      NATIVE_FEATURE(uniformAndStorageBuffer16BitAccess);
+      NATIVE_FEATURE(storagePushConstant16);
+      NATIVE_FEATURE(variablePointersStorageBuffer);
+      NATIVE_FEATURE(variablePointers);
+      NATIVE_FEATURE(shaderDrawParameters);
+      NATIVE_FEATURE(samplerMirrorClampToEdge);
+      NATIVE_FEATURE(drawIndirectCount);
+      NATIVE_FEATURE(storageBuffer8BitAccess);
+      NATIVE_FEATURE(uniformAndStorageBuffer8BitAccess);
+      NATIVE_FEATURE(storagePushConstant8);
+      NATIVE_FEATURE(shaderFloat16);
+      NATIVE_FEATURE(shaderInt8);
+      NATIVE_FEATURE(descriptorIndexing);
+      NATIVE_FEATURE(shaderSampledImageArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderUniformBufferArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderStorageImageArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderInputAttachmentArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderUniformTexelBufferArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderStorageTexelBufferArrayDynamicIndexing);
+      NATIVE_FEATURE(shaderUniformBufferArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderSampledImageArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderStorageBufferArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderStorageImageArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderInputAttachmentArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderUniformTexelBufferArrayNonUniformIndexing);
+      NATIVE_FEATURE(shaderStorageTexelBufferArrayNonUniformIndexing);
+      NATIVE_FEATURE(descriptorBindingUniformBufferUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingSampledImageUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingStorageImageUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingStorageBufferUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingUniformTexelBufferUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingStorageTexelBufferUpdateAfterBind);
+      NATIVE_FEATURE(descriptorBindingUpdateUnusedWhilePending);
+      NATIVE_FEATURE(descriptorBindingPartiallyBound);
+      NATIVE_FEATURE(descriptorBindingVariableDescriptorCount);
+      NATIVE_FEATURE(runtimeDescriptorArray);
+      NATIVE_FEATURE(samplerFilterMinmax);
+      NATIVE_FEATURE(scalarBlockLayout);
+      NATIVE_FEATURE(imagelessFramebuffer);
+      NATIVE_FEATURE(uniformBufferStandardLayout);
+      NATIVE_FEATURE(shaderSubgroupExtendedTypes);
+      NATIVE_FEATURE(separateDepthStencilLayouts);
+      NATIVE_FEATURE(hostQueryReset);
+      NATIVE_FEATURE(bufferDeviceAddress);
+      NATIVE_FEATURE(vulkanMemoryModel);
+      NATIVE_FEATURE(vulkanMemoryModelDeviceScope);
+      NATIVE_FEATURE(vulkanMemoryModelAvailabilityVisibilityChains);
+      /* vtn accepts a vertex or tessellation ViewportIndex output only with
+       * the ShaderViewportIndexLayerEXT capability (vtn_variables.c). That
+       * capability comes from EXT_shader_viewport_index_layer. NVK reports
+       * this extension with the 1.2 feature. Without it, spirv_to_nir fails
+       * with "invalid stage for SpvBuiltInViewportIndex".
+       */
+      NATIVE_EXTENSION(EXT_shader_viewport_index_layer);
+      NATIVE_FEATURE(shaderOutputViewportIndex);
+      NATIVE_FEATURE(shaderOutputLayer);
+      NATIVE_FEATURE(subgroupBroadcastDynamicId);
+      NATIVE_FEATURE(robustImageAccess);
+      NATIVE_FEATURE(inlineUniformBlock);
+      NATIVE_FEATURE(descriptorBindingInlineUniformBlockUpdateAfterBind);
+      NATIVE_FEATURE(pipelineCreationCacheControl);
+      NATIVE_FEATURE(privateData);
+      NATIVE_FEATURE(shaderDemoteToHelperInvocation);
+      NATIVE_FEATURE(shaderTerminateInvocation);
+      NATIVE_FEATURE(subgroupSizeControl);
+      NATIVE_FEATURE(computeFullSubgroups);
+      NATIVE_FEATURE(synchronization2);
+      NATIVE_FEATURE(shaderZeroInitializeWorkgroupMemory);
+      NATIVE_FEATURE(dynamicRendering);
+      NATIVE_FEATURE(shaderIntegerDotProduct);
+      NATIVE_FEATURE(maintenance4);
+      /* Compressed formats. */
+      NATIVE_FEATURE(textureCompressionBC);
+      NATIVE_FEATURE(textureCompressionASTC_LDR);
+      /* Core 1.0 features: clip and cull distance, vertex and fragment
+       * stores and atomics, pipeline statistics and precise occlusion
+       * queries, depth clamp, dual-source blending, large points, 32-bit
+       * indices above 2^24, robust buffer access and cube arrays.
+       */
+      NATIVE_FEATURE(shaderClipDistance);
+      NATIVE_FEATURE(shaderCullDistance);
+      NATIVE_FEATURE(vertexPipelineStoresAndAtomics);
+      NATIVE_FEATURE(fragmentStoresAndAtomics);
+      NATIVE_FEATURE(pipelineStatisticsQuery);
+      NATIVE_FEATURE(occlusionQueryPrecise);
+      NATIVE_FEATURE(depthClamp);
+      NATIVE_FEATURE(dualSrcBlend);
+      NATIVE_FEATURE(largePoints);
+      NATIVE_FEATURE(fullDrawIndexUint32);
+      NATIVE_FEATURE(robustBufferAccess);
+      NATIVE_FEATURE(imageCubeArray);
+      /* Extensions: push descriptors, robustness2 (out-of-bounds reads and
+       * null descriptors read 0), custom border colours, conditional
+       * rendering, depth clip control, transform feedback, and
+       * multiViewport with a geometry shader that selects the viewport.
+       */
+      NATIVE_FEATURE(multiViewport);
+      /* Gather with a non-constant offset, unformatted stores to an
+       * extended-format storage image, per-sample shading and variable
+       * multisample rate.
+       */
+      NATIVE_FEATURE(shaderImageGatherExtended);
+      NATIVE_FEATURE(shaderStorageImageWriteWithoutFormat);
+      NATIVE_FEATURE(shaderStorageImageExtendedFormats);
+      NATIVE_FEATURE(sampleRateShading);
+      NATIVE_FEATURE(variableMultisampleRate);
+      NATIVE_EXTENSION(KHR_push_descriptor);
+      NATIVE_FEATURE(pushDescriptor);
+      NATIVE_EXTENSION(EXT_robustness2);
+      NATIVE_FEATURE(robustBufferAccess2);
+      NATIVE_FEATURE(robustImageAccess2);
+      NATIVE_FEATURE(nullDescriptor);
+      NATIVE_EXTENSION(EXT_custom_border_color);
+      NATIVE_FEATURE(customBorderColors);
+      NATIVE_FEATURE(customBorderColorWithoutFormat);
+      NATIVE_EXTENSION(EXT_conditional_rendering);
+      NATIVE_FEATURE(conditionalRendering);
+      NATIVE_FEATURE(inheritedConditionalRendering);
+      NATIVE_EXTENSION(EXT_depth_clip_enable);
+      NATIVE_FEATURE(depthClipEnable);
+      NATIVE_EXTENSION(EXT_transform_feedback);
+      NATIVE_FEATURE(transformFeedback);
+      NATIVE_FEATURE(geometryStreams);
+      /* Dynamic state and rasterization. Enable only the tested
+       * sub-features. Dynamic logic op, patch control points, zero
+       * divisors, rectangular lines and smooth lines stay off.
+       */
+      /* The remaining core 1.0 features. */
+      NATIVE_FEATURE(depthBounds);
+      NATIVE_FEATURE(depthBiasClamp);
+      NATIVE_FEATURE(alphaToOne);
+      NATIVE_FEATURE(shaderStorageImageReadWithoutFormat);
+      NATIVE_FEATURE(shaderResourceMinLod);
+      /* CPU-side GPU time reads PTIMER through the delegated nvservices
+       * session (native_dev_read_timestamp).
+       */
+      NATIVE_EXTENSION(KHR_calibrated_timestamps);
+      NATIVE_EXTENSION(EXT_calibrated_timestamps);
+      /* Shader statistics from NAK. */
+      NATIVE_EXTENSION(KHR_pipeline_executable_properties);
+      NATIVE_FEATURE(pipelineExecutableInfo);
+      NATIVE_EXTENSION(EXT_extended_dynamic_state);
+      NATIVE_FEATURE(extendedDynamicState);
+      NATIVE_EXTENSION(EXT_extended_dynamic_state2);
+      NATIVE_FEATURE(extendedDynamicState2);
+      NATIVE_EXTENSION(EXT_extended_dynamic_state3);
+      NATIVE_FEATURE(extendedDynamicState3PolygonMode);
+      NATIVE_FEATURE(extendedDynamicState3ColorWriteMask);
+      NATIVE_EXTENSION(EXT_color_write_enable);
+      NATIVE_FEATURE(colorWriteEnable);
+      NATIVE_EXTENSION(EXT_vertex_input_dynamic_state);
+      NATIVE_FEATURE(vertexInputDynamicState);
+      NATIVE_EXTENSION(KHR_vertex_attribute_divisor);
+      NATIVE_EXTENSION(EXT_vertex_attribute_divisor);
+      NATIVE_FEATURE(vertexAttributeInstanceRateDivisor);
+      NATIVE_EXTENSION(KHR_index_type_uint8);
+      NATIVE_EXTENSION(EXT_index_type_uint8);
+      NATIVE_FEATURE(indexTypeUint8);
+      NATIVE_EXTENSION(EXT_provoking_vertex);
+      NATIVE_FEATURE(provokingVertexLast);
+      NATIVE_EXTENSION(KHR_line_rasterization);
+      NATIVE_EXTENSION(EXT_line_rasterization);
+      NATIVE_FEATURE(bresenhamLines);
+      NATIVE_FEATURE(stippledBresenhamLines);
+      /* NVK reports ETC2 off for desktop GPUs. NIL samples every ETC2 and
+       * EAC format on SoCs from Kepler C onward (supports_texturing in nil
+       * format.rs). This is the same condition as for ASTC.
+       */
+      supported_features.textureCompressionETC2 =
+         nvk_has_astc(&nvkmd->dev_info);
+      NATIVE_EXTENSION(KHR_8bit_storage);
+      NATIVE_EXTENSION(KHR_16bit_storage);
+      NATIVE_EXTENSION(KHR_bind_memory2);
+      NATIVE_EXTENSION(KHR_buffer_device_address);
+      NATIVE_EXTENSION(KHR_copy_commands2);
+      NATIVE_EXTENSION(KHR_create_renderpass2);
+      NATIVE_EXTENSION(KHR_dedicated_allocation);
+      NATIVE_EXTENSION(KHR_depth_stencil_resolve);
+      NATIVE_EXTENSION(KHR_descriptor_update_template);
+      NATIVE_EXTENSION(KHR_draw_indirect_count);
+      NATIVE_EXTENSION(KHR_driver_properties);
+      NATIVE_EXTENSION(KHR_dynamic_rendering);
+      NATIVE_EXTENSION(KHR_format_feature_flags2);
+      NATIVE_EXTENSION(KHR_get_memory_requirements2);
+      NATIVE_EXTENSION(KHR_image_format_list);
+      NATIVE_EXTENSION(KHR_imageless_framebuffer);
+      NATIVE_EXTENSION(KHR_maintenance1);
+      NATIVE_EXTENSION(KHR_maintenance2);
+      NATIVE_EXTENSION(KHR_maintenance3);
+      NATIVE_EXTENSION(KHR_maintenance4);
+      NATIVE_EXTENSION(KHR_multiview);
+      NATIVE_EXTENSION(KHR_sampler_mirror_clamp_to_edge);
+      NATIVE_EXTENSION(KHR_separate_depth_stencil_layouts);
+      NATIVE_EXTENSION(KHR_shader_draw_parameters);
+      NATIVE_EXTENSION(KHR_shader_float16_int8);
+      NATIVE_EXTENSION(KHR_shader_float_controls);
+      NATIVE_EXTENSION(KHR_shader_integer_dot_product);
+      NATIVE_EXTENSION(KHR_shader_non_semantic_info);
+      NATIVE_EXTENSION(KHR_shader_subgroup_extended_types);
+      NATIVE_EXTENSION(KHR_shader_terminate_invocation);
+      NATIVE_EXTENSION(KHR_spirv_1_4);
+      NATIVE_EXTENSION(KHR_storage_buffer_storage_class);
+      NATIVE_EXTENSION(KHR_synchronization2);
+      NATIVE_EXTENSION(KHR_uniform_buffer_standard_layout);
+      NATIVE_EXTENSION(KHR_variable_pointers);
+      NATIVE_EXTENSION(KHR_vulkan_memory_model);
+      NATIVE_EXTENSION(KHR_zero_initialize_workgroup_memory);
+      NATIVE_EXTENSION(EXT_descriptor_indexing);
+      NATIVE_EXTENSION(EXT_host_query_reset);
+      NATIVE_EXTENSION(EXT_image_robustness);
+      NATIVE_EXTENSION(EXT_inline_uniform_block);
+      NATIVE_EXTENSION(EXT_pipeline_creation_cache_control);
+      NATIVE_EXTENSION(EXT_private_data);
+      NATIVE_EXTENSION(EXT_sampler_filter_minmax);
+      NATIVE_EXTENSION(EXT_scalar_block_layout);
+      NATIVE_EXTENSION(EXT_separate_stencil_usage);
+      NATIVE_EXTENSION(EXT_shader_demote_to_helper_invocation);
+      NATIVE_EXTENSION(EXT_subgroup_size_control);
+      NATIVE_EXTENSION(EXT_texel_buffer_alignment);
+      NATIVE_EXTENSION(EXT_tooling_info);
+      /* Zink requires maintenance5 below Vulkan 1.4 (zink_device_info.py).
+       * The NVK implementation is API level: flags2, BindIndexBuffer2, and
+       * the rendering-area and subresource-layout queries.
+       */
+      NATIVE_EXTENSION(KHR_maintenance5);
+      NATIVE_FEATURE(maintenance5);
+      /* The other Vulkan 1.4 extensions that are API or compiler level in
+       * NVK: maintenance6 (flags2 binds and push constants), load and store
+       * operation NONE, vkMapMemory2, local reads in dynamic rendering,
+       * subgroup rotate, float controls 2, expect/assume, pipeline
+       * robustness, and the global priority query (only the default
+       * priority: NVK reports and accepts only the medium priority). Each is
+       * checked by its CTS group on the console.
+       */
+      NATIVE_EXTENSION(KHR_maintenance6);
+      NATIVE_FEATURE(maintenance6);
+      NATIVE_EXTENSION(KHR_load_store_op_none);
+      NATIVE_EXTENSION(KHR_map_memory2);
+      NATIVE_EXTENSION(KHR_dynamic_rendering_local_read);
+      NATIVE_FEATURE(dynamicRenderingLocalRead);
+      NATIVE_EXTENSION(KHR_shader_subgroup_rotate);
+      NATIVE_FEATURE(shaderSubgroupRotate);
+      NATIVE_FEATURE(shaderSubgroupRotateClustered);
+      NATIVE_EXTENSION(KHR_shader_float_controls2);
+      NATIVE_FEATURE(shaderFloatControls2);
+      NATIVE_EXTENSION(KHR_shader_expect_assume);
+      NATIVE_FEATURE(shaderExpectAssume);
+      NATIVE_EXTENSION(EXT_pipeline_robustness);
+      NATIVE_FEATURE(pipelineRobustness);
+      NATIVE_EXTENSION(KHR_global_priority);
+      NATIVE_EXTENSION(EXT_global_priority);
+      NATIVE_EXTENSION(EXT_global_priority_query);
+      NATIVE_FEATURE(globalPriorityQuery);
+      /* Host image copy: CPU copies between host memory and images. An
+       * image with host transfer usage uses only host-visible memory types
+       * on the native backend (nvk_get_image_memory_requirements), whose
+       * maps are GPU-uncached.
+       */
+      NATIVE_EXTENSION(EXT_host_image_copy);
+      NATIVE_FEATURE(hostImageCopy);
+      /* Vulkan 1.4 requires YCbCr conversion. NVK samples the multi-planar
+       * formats with one texture per plane. Every plane binds like a single
+       * plane colour image.
+       */
+      NATIVE_EXTENSION(KHR_sampler_ycbcr_conversion);
+      NATIVE_FEATURE(samplerYcbcrConversion);
+      /* Optional extensions that DXVK uses. Each is API and compiler level
+       * NVK functionality, with no native service dependency.
+       */
+      NATIVE_EXTENSION(KHR_pipeline_library);
+      NATIVE_EXTENSION(EXT_graphics_pipeline_library);
+      NATIVE_FEATURE(graphicsPipelineLibrary);
+      NATIVE_EXTENSION(EXT_multi_draw);
+      NATIVE_FEATURE(multiDraw);
+      NATIVE_EXTENSION(EXT_conservative_rasterization);
+      NATIVE_EXTENSION(EXT_sample_locations);
+      NATIVE_EXTENSION(EXT_shader_module_identifier);
+      NATIVE_FEATURE(shaderModuleIdentifier);
+      NATIVE_EXTENSION(EXT_border_color_swizzle);
+      NATIVE_FEATURE(borderColorSwizzle);
+      NATIVE_FEATURE(borderColorSwizzleFromImage);
+      NATIVE_EXTENSION(EXT_depth_bias_control);
+      NATIVE_FEATURE(depthBiasControl);
+      NATIVE_FEATURE(leastRepresentableValueForceUnormRepresentation);
+      NATIVE_FEATURE(floatRepresentation);
+      NATIVE_FEATURE(depthBiasExact);
+      NATIVE_EXTENSION(EXT_attachment_feedback_loop_layout);
+      NATIVE_FEATURE(attachmentFeedbackLoopLayout);
+      NATIVE_EXTENSION(EXT_non_seamless_cube_map);
+      NATIVE_FEATURE(nonSeamlessCubeMap);
+      NATIVE_EXTENSION(EXT_dynamic_rendering_unused_attachments);
+      NATIVE_FEATURE(dynamicRenderingUnusedAttachments);
+      NATIVE_EXTENSION(KHR_maintenance7);
+      NATIVE_FEATURE(maintenance7);
+      NATIVE_EXTENSION(KHR_shader_subgroup_uniform_control_flow);
+      NATIVE_FEATURE(shaderSubgroupUniformControlFlow);
+      /* Queries, storage images and 64-bit atomics. */
+      NATIVE_FEATURE(inheritedQueries);
+      /* Sparse binding without residency. */
+      NATIVE_FEATURE(sparseBinding);
+      NATIVE_FEATURE(shaderStorageImageMultisample);
+      NATIVE_EXTENSION(KHR_shader_atomic_int64);
+      NATIVE_FEATURE(shaderBufferInt64Atomics);
+      NATIVE_FEATURE(shaderSharedInt64Atomics);
+      NATIVE_EXTENSION(EXT_shader_image_atomic_int64);
+      NATIVE_FEATURE(shaderImageInt64Atomics);
+      NATIVE_EXTENSION(EXT_shader_atomic_float);
+      NATIVE_FEATURE(shaderBufferFloat32Atomics);
+      NATIVE_FEATURE(shaderBufferFloat32AtomicAdd);
+      NATIVE_FEATURE(shaderSharedFloat32Atomics);
+      NATIVE_FEATURE(shaderSharedFloat32AtomicAdd);
+      NATIVE_FEATURE(shaderImageFloat32Atomics);
+      NATIVE_FEATURE(shaderImageFloat32AtomicAdd);
+      /* The other dynamic states. Dynamic rasterization
+       * samples, sample mask, alpha to coverage and one, and sample
+       * locations enable stay off: their CTS extended_dynamic_state cases
+       * failed (91 of them, 9 November 2026). */
+      NATIVE_FEATURE(extendedDynamicState2LogicOp);
+      NATIVE_FEATURE(extendedDynamicState2PatchControlPoints);
+      NATIVE_FEATURE(extendedDynamicState3TessellationDomainOrigin);
+      NATIVE_FEATURE(extendedDynamicState3DepthClampEnable);
+      NATIVE_FEATURE(extendedDynamicState3LogicOpEnable);
+      NATIVE_FEATURE(extendedDynamicState3ColorBlendEnable);
+      NATIVE_FEATURE(extendedDynamicState3ColorBlendEquation);
+      NATIVE_FEATURE(extendedDynamicState3RasterizationStream);
+      NATIVE_FEATURE(extendedDynamicState3DepthClipEnable);
+      NATIVE_FEATURE(extendedDynamicState3ProvokingVertexMode);
+      NATIVE_FEATURE(extendedDynamicState3LineRasterizationMode);
+      NATIVE_FEATURE(extendedDynamicState3LineStippleEnable);
+      NATIVE_FEATURE(extendedDynamicState3DepthClipNegativeOneToOne);
+#undef NATIVE_FEATURE
+#undef NATIVE_EXTENSION
+      /* Host-pointer imports (VK_EXT_external_memory_host), for buffers.
+       * Imported memory has the HOST_CACHED readback memory type.
+       */
+      if (nvkmd->has_host_ptr_import) {
+         supported_extensions.EXT_external_memory_host = true;
+         properties.minImportedHostPointerAlignment = nvkmd->host_ptr_align_B;
+      }
+      /* Vulkan 1.4: the 1.4 core features above (maintenance5 and 6, push
+       * descriptors, dynamic rendering local read, host image copy and the
+       * others). The CTS checks the 1.4 requirements on the console.
+       */
+      properties.apiVersion = VK_API_VERSION_1_4;
+      /* The NVK compute limits apply: 1024 invocations, 1024x1024x64 and
+       * 48 KiB shared memory.
+       */
+   }
+
+#ifndef __SWITCH__
    if (nvkmd->drm.render_dev) {
       properties.drmHasRender = true;
       properties.drmRenderMajor = major(nvkmd->drm.render_dev);
@@ -1560,6 +1991,7 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
       properties.drmPrimaryMajor = major(nvkmd->drm.primary_dev);
       properties.drmPrimaryMinor = minor(nvkmd->drm.primary_dev);
    }
+#endif
 
    result = vk_physical_device_init(&pdev->vk, &instance->vk,
                                     &supported_extensions,
@@ -1573,6 +2005,9 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->info = nvkmd->dev_info;
    pdev->debug_flags = instance->debug_flags;
 
+   nil_set_sector_promotion(
+      !(pdev->debug_flags & NVK_DEBUG_NO_SECTOR_PROMOTION));
+
    pdev->nak = nak_compiler_create(&pdev->info);
    if (pdev->nak == NULL) {
       result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1581,7 +2016,7 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
 
    nvk_physical_device_init_pipeline_cache(pdev);
 
-   uint64_t heap_size =
+   uint64_t heap_size = bounded_native ? nvkmd->bounded_sysmem_size_B :
       os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
                            &instance->drirc.misc.heap_memory_percent);
    if (heap_size == 0) {
@@ -1631,7 +2066,8 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->mem_heaps[sysmem_heap_idx] = (struct nvk_memory_heap) {
       .size = heap_size,
       .flags = 0,
-      .available = nvk_get_sysmem_heap_available,
+      .available = bounded_native ? nvk_get_bounded_sysmem_heap_available :
+                                    nvk_get_sysmem_heap_available,
    };
 
    if (pdev->info.type == NV_DEVICE_TYPE_SOC) {
@@ -1643,18 +2079,65 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
       assert(pdev->mem_heap_count == 1);
       pdev->mem_heaps[sysmem_heap_idx].flags |= VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
-      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
-         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-         .heapIndex = sysmem_heap_idx,
-      };
-      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
-         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-         .heapIndex = sysmem_heap_idx,
-      };
+      if (bounded_native) {
+         if (nvkmd->has_cached_memory) {
+            /* The native GPU-cacheable segments give GPU-only memory.
+             * Vulkan puts property sets that are strict subsets first.
+             * Device-local requests thus find this type. Host-visible
+             * requests use the coherent type below. Every type shares the
+             * one heap, because the native pools grow from one span.
+             */
+            pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+               .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+               .heapIndex = sysmem_heap_idx,
+            };
+         }
+         if (nvkmd->has_borrowed_display_targets) {
+            /* Vulkan puts property sets that are strict subsets first.
+             * Borrowed display targets have a GPU VA but no CPU mapping.
+             */
+            pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+               .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+               .heapIndex = sysmem_heap_idx,
+            };
+         }
+         /* The native owner binds a mode-2 CPU-uncached backing to a
+          * GPU-uncached ordinary map. This is a candidate coherent type.
+          */
+         pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            .heapIndex = sysmem_heap_idx,
+         };
+         if (nvkmd->has_readback_memory) {
+            /* The native CPU-cached readback segments use backing mode 1
+             * and a GPU-uncached map. CPU reads are fast. Flush and
+             * invalidate use dc civac. This type comes after the coherent
+             * type, so a plain HOST_VISIBLE search still finds coherent
+             * memory.
+             */
+            pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+               .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+               .heapIndex = sysmem_heap_idx,
+            };
+         }
+      } else {
+         pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            .heapIndex = sysmem_heap_idx,
+         };
+         pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+            .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            .heapIndex = sysmem_heap_idx,
+         };
+      }
    } else {
       /* On discrete GPUs, all sysmem maps are cached+coherent and the GPU
        * snoops the CPU caches when it accesses memory across the PCI bus.
@@ -1671,16 +2154,19 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
    pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
-      .queue_flags = VK_QUEUE_GRAPHICS_BIT |
-                     VK_QUEUE_COMPUTE_BIT |
+      /* The native C797 3D class is in the engine set that the retained
+       * compute queue already initialized. Keep the optional Vulkan feature
+       * restrictions above while the first graphics clear is under test.
+       */
+      .queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
                      VK_QUEUE_TRANSFER_BIT |
-                     VK_QUEUE_SPARSE_BINDING_BIT,
+                     (nvkmd->kmd_info.has_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
       .queue_count = 1,
    };
    if (pdev->info.has_transfer_queue) {
       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
          .queue_flags = VK_QUEUE_TRANSFER_BIT |
-                        VK_QUEUE_SPARSE_BINDING_BIT,
+                        (nvkmd->kmd_info.has_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
          .queue_count = 2,
       };
    }
@@ -1709,6 +2195,46 @@ fail_nvkmd:
    nvkmd_pdev_destroy(nvkmd);
    return result;
 }
+
+VkResult
+nvk_create_drm_physical_device(struct vk_instance *_instance,
+                               struct _drmDevice *drm_device,
+                               struct vk_physical_device **pdev_out)
+{
+   struct nvk_instance *instance = (struct nvk_instance *)_instance;
+
+   struct nvkmd_pdev *nvkmd;
+   VkResult result =
+      nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
+                                    instance->debug_flags, &nvkmd);
+   if (result != VK_SUCCESS)
+      return result;
+
+   return nvk_physical_device_create(instance, nvkmd, pdev_out);
+}
+
+#ifdef __SWITCH__
+VkResult
+nvk_enumerate_physical_device(struct vk_instance *_instance)
+{
+   struct nvk_instance *instance = (struct nvk_instance *)_instance;
+
+   struct nvkmd_pdev *nvkmd;
+   VkResult result = nvkmd_try_create_pdev(&instance->vk.base,
+                                           instance->debug_flags, &nvkmd);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct vk_physical_device *pdev;
+   result = nvk_physical_device_create(instance, nvkmd, &pdev);
+   if (result != VK_SUCCESS)
+      return result;
+
+   list_addtail(&pdev->link, &instance->vk.physical_devices.list);
+
+   return VK_SUCCESS;
+}
+#endif
 
 void
 nvk_physical_device_destroy(struct vk_physical_device *vk_pdev)

@@ -199,6 +199,8 @@ nvk_cmd_buffer_flush_push(struct nvk_cmd_buffer *cmd, bool incomplete)
       };
       util_dynarray_append(&cmd->pushes, push);
 
+      nvk_cmd_mem_add_used(cmd->push_mem, mem_offset + push.range);
+
       cmd->prev_subc = NVC0_FIFO_SUBC_FROM_PKHDR(cmd->push.last_hdr_dw);
    }
 
@@ -263,6 +265,7 @@ nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
       *ptr = (char *)cmd->upload_mem->mem->map + offset;
 
       cmd->upload_offset = offset + size;
+      nvk_cmd_mem_add_used(cmd->upload_mem, cmd->upload_offset);
 
       return VK_SUCCESS;
    }
@@ -274,6 +277,7 @@ nvk_cmd_buffer_upload_alloc(struct nvk_cmd_buffer *cmd,
 
    *addr = mem->mem->va->addr;
    *ptr = mem->mem->map;
+   nvk_cmd_mem_add_used(mem, size);
 
    /* Pick whichever of the current upload BO and the new BO will have more
     * room left to be the BO for the next upload.  If our upload size is
@@ -382,8 +386,23 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 static void
 flush_mem_list(struct nvk_cmd_buffer *cmd, struct list_head *mem_list)
 {
-   list_for_each_entry_safe(struct nvk_cmd_mem, mem, mem_list, link)
-      nvkmd_mem_sync_map_to_gpu(mem->mem, 0, mem->mem->size_B);
+   const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+   const uint32_t atom_size_B = pdev->info.nc_atom_size_B;
+   const bool flush_all = pdev->debug_flags & NVK_DEBUG_FULL_CMD_FLUSH;
+
+   list_for_each_entry_safe(struct nvk_cmd_mem, mem, mem_list, link) {
+      uint64_t range_B = mem->mem->size_B;
+
+      if (!flush_all) {
+         if (mem->used_B == 0)
+            continue;
+         range_B = MIN2(ALIGN_POT(mem->used_B, atom_size_B), range_B);
+      }
+
+      nvkmd_mem_sync_map_to_gpu(mem->mem, 0, range_B);
+      mem->used_B = 0;
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -470,6 +489,49 @@ enum nvk_barrier {
    NVK_BARRIER_HOST_WFI_INVALIDATE_SYSMEM = 1 << 8,
    NVK_BARRIER_HOST_WFI_FLUSH_SYSMEM      = 1 << 9,
 };
+
+#ifdef __SWITCH__
+/* The native backend's debug switches (nvkmd_nvgpu_native_ctx.c). */
+extern uint32_t ouncevk_debug_sync_flags;
+#endif
+
+/* Waits for idle on the engine of the last subchannel. */
+static void
+nvk_cmd_wfi_last_subchannel(struct nvk_cmd_buffer *cmd)
+{
+   switch (nvk_cmd_buffer_last_subchannel(cmd)) {
+   case SUBC_NV9097: {
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+      P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
+      break;
+   }
+   case SUBC_NV90C0: {
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+      P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+      break;
+   }
+   default:
+      assert(!"Unknown subc");
+      FALLTHROUGH;
+   case SUBC_NV90B5: {
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+      P_MTHD(p, NV90B5, LINE_LENGTH_IN);
+      P_NV90B5_LINE_LENGTH_IN(p, 0);
+      P_NV90B5_LINE_COUNT(p, 0);
+
+      P_IMMD(p, NV90B5, LAUNCH_DMA, {
+         .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
+         .multi_line_enable = false,
+         .flush_enable = FLUSH_ENABLE_TRUE,
+         /* Note: FLUSH_TYPE=SYS implicitly for NVC3B5+ */
+         .src_memory_layout = SRC_MEMORY_LAYOUT_PITCH,
+         .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
+         .remap_enable = REMAP_ENABLE_TRUE,
+      });
+      break;
+   }
+   }
+}
 
 static enum nvk_barrier
 nvk_barrier_flushes_waits(VkPipelineStageFlags2 stages,
@@ -609,6 +671,15 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
       return;
 
    if (barriers & NVK_BARRIER_FLUSH_SHADER_DATA) {
+#ifdef __SWITCH__
+      /* On the Switch 2 GPU the cache flush below does not wait for work
+       * in flight: a following draw or copy read storage images that
+       * fragment, vertex, tessellation or geometry shaders (or a copy) were
+       * still writing (CTS synchronization.op image cases: a contiguous run
+       * of texels read before they were written). Wait for idle first, then
+       * invalidate the shader caches without another WFI. */
+      nvk_cmd_wfi_last_subchannel(cmd);
+#endif
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
 
       /* This is also implicitly a WFI */
@@ -629,39 +700,42 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
        * We only need to WFI on a single channel. The others will implicitly get
        * a WFI from the channel switch.
        */
-      switch (nvk_cmd_buffer_last_subchannel(cmd)) {
-      case SUBC_NV9097: {
-         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
-         P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
-         break;
-      }
-      case SUBC_NV90C0: {
-         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
-         P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
-         break;
-      }
-      default:
-         assert(!"Unknown subc");
-         FALLTHROUGH;
-      case SUBC_NV90B5: {
-         struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
-         P_MTHD(p, NV90B5, LINE_LENGTH_IN);
-         P_NV90B5_LINE_LENGTH_IN(p, 0);
-         P_NV90B5_LINE_COUNT(p, 0);
+      nvk_cmd_wfi_last_subchannel(cmd);
+   }
 
-         P_IMMD(p, NV90B5, LAUNCH_DMA, {
-            .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
-            .multi_line_enable = false,
-            .flush_enable = FLUSH_ENABLE_TRUE,
-            /* Note: FLUSH_TYPE=SYS implicitly for NVC3B5+ */
-            .src_memory_layout = SRC_MEMORY_LAYOUT_PITCH,
-            .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
-            .remap_enable = REMAP_ENABLE_TRUE,
-         });
-         break;
+#ifdef __SWITCH__
+   if (ouncevk_debug_sync_flags & 32) {
+      /* Experiment switches for the steps of an ordered L2 barrier:
+       * 32: wait for idle (when not done above) and SET_REFERENCE;
+       * 512: dirty L2 flush and system memory barrier;
+       * 1024: L2 invalidate;
+       * 2048: shader and texture cache invalidation on both classes. */
+      if (!(barriers & NVK_BARRIER_FLUSH_SHADER_DATA))
+         nvk_cmd_wfi_last_subchannel(cmd);
+      struct nv_push *l2 = nvk_cmd_buffer_push(cmd, 14);
+      const uint32_t subc = nvk_cmd_buffer_last_subchannel(cmd);
+      __push_immd(l2, subc, NV906F_SET_REFERENCE, 0);
+      if (ouncevk_debug_sync_flags & 512) {
+         __push_mthd(l2, subc, NVC86F_MEM_OP_D);
+         P_NVC86F_MEM_OP_D(l2, { .operation = 0x10 }); /* L2_FLUSH_DIRTY */
+         __push_mthd(l2, subc, NVC86F_MEM_OP_A);
+         P_NVC86F_MEM_OP_A(l2, {});
+         P_NVC86F_MEM_OP_B(l2, 0);
+         P_NVC86F_MEM_OP_C(l2, { .membar_type = 0 }); /* SYS_MEMBAR */
+         P_NVC86F_MEM_OP_D(l2, { .operation = OPERATION_MEMBAR });
       }
+      if (ouncevk_debug_sync_flags & 1024) {
+         __push_mthd(l2, subc, NVC86F_MEM_OP_D);
+         P_NVC86F_MEM_OP_D(l2, { .operation = 0xe }); /* L2 invalidate */
+      }
+      if (ouncevk_debug_sync_flags & 2048) {
+         __push_immd(l2, SUBC_NV9097, 0x1288, 0);
+         __push_immd(l2, SUBC_NV9097, 0x0da4, 0x1011);
+         __push_immd(l2, SUBC_NV90C0, 0x1288, 0);
+         __push_immd(l2, SUBC_NV90C0, 0x1698, 0x1011);
       }
    }
+#endif
 
    if (barriers & NVK_BARRIER_HOST_WFI_INVALIDATE_SYSMEM) {
       struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
@@ -1254,6 +1328,7 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
    const uint32_t min_cbuf_alignment = nvk_min_cbuf_alignment(&pdev->info);
+   const bool full = pdev->debug_flags & NVK_DEBUG_FULL_PUSH_DESC;
    VkResult result;
 
    u_foreach_bit(set_idx, desc->push_dirty) {
@@ -1261,9 +1336,15 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
          continue;
 
       struct nvk_push_descriptor_set *push_set = desc->sets[set_idx].push;
+
+      uint32_t upload_size_B = align(push_set->size_B, min_cbuf_alignment);
+      if (upload_size_B == 0 || full)
+         upload_size_B = sizeof(push_set->data);
+      assert(upload_size_B <= sizeof(push_set->data));
+
       uint64_t push_set_addr;
       result = nvk_cmd_buffer_upload_data(cmd, push_set->data,
-                                          sizeof(push_set->data),
+                                          upload_size_B,
                                           min_cbuf_alignment,
                                           &push_set_addr);
       if (unlikely(result != VK_SUCCESS)) {
@@ -1273,10 +1354,13 @@ nvk_cmd_buffer_flush_push_descriptors(struct nvk_cmd_buffer *cmd,
 
       struct nvk_buffer_address set_addr = {
          .base_addr = push_set_addr,
-         .size = sizeof(push_set->data),
+         .size = upload_size_B,
       };
       nvk_descriptor_state_set_root(cmd, desc, sets[set_idx], set_addr);
    }
+
+   if (!full)
+      desc->push_dirty = 0;
 }
 
 void

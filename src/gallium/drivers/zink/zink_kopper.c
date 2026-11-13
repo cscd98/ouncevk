@@ -51,8 +51,13 @@ zink_kopper_set_present_mode_for_interval(struct kopper_displaytarget *cdt, int 
       if (cdt->present_modes & BITFIELD_BIT(VK_PRESENT_MODE_IMMEDIATE_KHR) &&
           cdt->type != KOPPER_WAYLAND)
          cdt->present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-      else
+      else if (cdt->present_modes & BITFIELD_BIT(VK_PRESENT_MODE_MAILBOX_KHR))
          cdt->present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+      else
+         /* FIFO is the only mode that is always available. The interval
+          * stays 1.
+          */
+         cdt->present_mode = VK_PRESENT_MODE_FIFO_KHR;
    } else if (interval > 0) {
       cdt->present_mode = VK_PRESENT_MODE_FIFO_KHR;
    }
@@ -78,6 +83,11 @@ init_dt_type(struct kopper_displaytarget *cdt)
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    case VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR:
       cdt->type = KOPPER_WIN32;
+      break;
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   case VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN:
+      cdt->type = KOPPER_VI;
       break;
 #endif
    default:
@@ -116,6 +126,13 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
    case VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR: {
       VkWin32SurfaceCreateInfoKHR *win32 = (VkWin32SurfaceCreateInfoKHR *)&cdt->info.bos;
       error = VKSCR(CreateWin32SurfaceKHR)(screen->instance, win32, NULL, &surface);
+      break;
+   }
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   case VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN: {
+      VkViSurfaceCreateInfoNN *vi = (VkViSurfaceCreateInfoNN *)&cdt->info.bos;
+      error = VKSCR(CreateViSurfaceNN)(screen->instance, vi, NULL, &surface);
       break;
    }
 #endif
@@ -158,6 +175,10 @@ destroy_swapchain(struct zink_screen *screen, struct kopper_swapchain *cswap)
 {
    if (!cswap)
       return;
+   /* A queued async present can still submit to this swapchain. Wait for it
+    * to complete before the swapchain is destroyed.
+    */
+   util_queue_fence_wait(&cswap->present_fence);
    util_queue_fence_destroy(&cswap->present_fence);
    for (unsigned i = 0; i < cswap->num_images; i++) {
       /* Destroy the acquire semaphore directly, if any.  If acquire != NULL
@@ -191,9 +212,10 @@ prune_old_swapchains(struct zink_screen *screen, struct kopper_displaytarget *cd
    while (cdt->old_swapchain) {
       struct kopper_swapchain *cswap = cdt->old_swapchain;
       if (cswap->async_presents) {
-         if (wait)
-            continue;
-         return;
+         if (!wait)
+            return;
+
+         util_queue_fence_wait(&cswap->present_fence);
       }
       struct zink_batch_usage *u = cswap->batch_uses;
       if (!zink_screen_usage_check_completion(screen, u)) {
@@ -232,6 +254,13 @@ find_dt_entry(struct zink_screen *screen, const struct kopper_displaytarget *cdt
    case KOPPER_WIN32: {
       VkWin32SurfaceCreateInfoKHR *win32 = (VkWin32SurfaceCreateInfoKHR *)&cdt->info.bos;
       he = _mesa_hash_table_search(&screen->dts, win32->hwnd);
+      break;
+   }
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   case KOPPER_VI: {
+      VkViSurfaceCreateInfoNN *vi = (VkViSurfaceCreateInfoNN *)&cdt->info.bos;
+      he = _mesa_hash_table_search(&screen->dts, vi->window);
       break;
    }
 #endif
@@ -313,6 +342,7 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
    switch (cdt->type) {
    case KOPPER_X11:
    case KOPPER_WIN32:
+   case KOPPER_VI:
       /* With Xcb, minImageExtent, maxImageExtent, and currentExtent must always equal the window size.
        * ...
        * Due to above restrictions, it is only possible to create a new swapchain on this
@@ -444,6 +474,7 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
             break;
          case KOPPER_WAYLAND:
          case KOPPER_WIN32:
+         case KOPPER_VI:
             _mesa_hash_table_init(&screen->dts, screen, _mesa_hash_pointer, _mesa_key_pointer_equal);
             break;
          default:
@@ -513,6 +544,13 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
    case KOPPER_WIN32: {
       VkWin32SurfaceCreateInfoKHR *win32 = (VkWin32SurfaceCreateInfoKHR *)&cdt->info.bos;
       _mesa_hash_table_insert(&screen->dts, win32->hwnd, cdt);
+      break;
+   }
+#endif
+#ifdef VK_USE_PLATFORM_VI_NN
+   case KOPPER_VI: {
+      VkViSurfaceCreateInfoNN *vi = (VkViSurfaceCreateInfoNN *)&cdt->info.bos;
+      _mesa_hash_table_insert(&screen->dts, vi->window, cdt);
       break;
    }
 #endif
@@ -665,6 +703,12 @@ kill_swapchain(struct zink_context *ctx, struct zink_resource *res)
    mesa_loge("zink: swapchain killed %p\n", res);
    zink_batch_reference_resource(ctx, res);
    struct pipe_resource *pres = screen->base.resource_create(&screen->base, &res->base.b);
+   if (!pres) {
+      /* Out of memory. Keep res on its dead swapchain object, and do not
+       * dereference pres.
+       */
+      return;
+   }
    zink_resource_object_reference(screen, &res->obj, zink_resource(pres)->obj);
    res->rebind_count++;
    res->layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -858,7 +902,7 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
       mesa_loge("ZINK: failed to allocate cpi!");
       return;
    }
-      
+
    cpi->sem = res->obj->present;
    cpi->res = res;
    cpi->swapchain = cdt->swapchain;
@@ -882,7 +926,7 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
       cpi->region.pRectangles = cpi->regions;
       for (unsigned i = 0; i < nrects; i++) {
          cpi->regions[i].offset.x = boxes[i].x;
-         /* 
+         /*
             2) Where is the origin of the VkRectLayerKHR?
 
             RESOLVED: The upper left corner of the presentable image(s) of the swapchain, per the definition of framebuffer coordinates.

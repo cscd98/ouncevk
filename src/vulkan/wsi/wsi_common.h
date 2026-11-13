@@ -52,7 +52,15 @@ struct vk_queue;
 
 struct driOptionCache;
 
+#ifdef VK_USE_PLATFORM_VI_NN
+struct wsi_native_vi_window;
+struct wsi_native_vi_import;
+struct vk_device;
+struct vk_sync;
+#define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_VI + 1)
+#else
 #define VK_ICD_WSI_PLATFORM_MAX (VK_ICD_WSI_PLATFORM_METAL + 1)
+#endif
 
 struct wsi_device {
    /* Allocator for the instance */
@@ -154,6 +162,54 @@ struct wsi_device {
       void (*encode_drawable_present)(VkCommandBuffer cmd, void *drawable);
    } metal;
 
+#ifdef VK_USE_PLATFORM_VI_NN
+   struct {
+      VkResult (*native_open)(struct wsi_native_vi_window *window);
+      VkResult (*native_import)(VkDevice device, VkImage image,
+                                 VkDeviceMemory memory,
+                                 struct wsi_native_vi_window *window,
+                                 struct wsi_native_vi_import *import);
+      VkResult (*native_availability)(struct wsi_native_vi_window *window,
+                                       uint64_t *mask);
+      VkResult (*native_counter)(struct wsi_native_vi_window *window,
+                                  uint32_t token, uint64_t *value, uint8_t *mode);
+      /* VI2 availability notifications for the window's layer.
+       * consume: collects the pending notifications and clears this layer's
+       * indication. Call it before each availability query.
+       * wait: returns VK_SUCCESS when an indication is pending, or
+       * VK_TIMEOUT after timeout_ns. */
+      VkResult (*native_availability_consume)(
+         struct wsi_native_vi_window *window);
+      VkResult (*native_availability_wait)(struct wsi_native_vi_window *window,
+                                           uint64_t timeout_ns);
+      /* Creates a sync payload for a pending VI2 release (a 16-byte
+       * dependency). Queue waits wait for it on the GPU. CPU waits poll it.
+       * If this hook is NULL, acquire waits for the release on the CPU. */
+      VkResult (*native_release_sync)(struct vk_device *device,
+                                      struct wsi_native_vi_window *window,
+                                      const uint8_t release[16],
+                                      struct vk_sync **sync_out);
+      /* Returns the GPU producer of the present fence as the VI2 f5
+       * producer16 value.
+       * VK_SUCCESS: pass the producer to present. It is all zero when the
+       * work is already complete.
+       * VK_NOT_READY: nothing is submitted yet. The caller waits for the
+       * fence on the CPU. */
+      VkResult (*native_fence_dependency)(VkDevice device, VkFence fence,
+                                          uint8_t producer[16]);
+      VkResult (*native_present)(struct wsi_native_vi_window *window,
+                                  uint8_t slot, uint32_t image,
+                                  const uint8_t producer[16],
+                                  uint64_t *mask, uint8_t release[16]);
+      VkResult (*native_disable)(struct wsi_native_vi_window *window,
+                                  uint8_t slot, uint64_t *mask);
+      VkResult (*native_retire_image)(VkDevice device, VkDeviceMemory memory,
+                                      struct wsi_native_vi_window *window,
+                                      struct wsi_native_vi_import *import);
+      void (*native_startup)(struct wsi_native_vi_window *window);
+      void (*native_pause)(uint64_t ns);
+   } vi;
+#endif
 
    bool sw;
 

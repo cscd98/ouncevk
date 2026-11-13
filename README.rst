@@ -1,6 +1,16 @@
+OunceVK: NVK for Nintendo Switch 2
+==================================
+
+OunceVK is NVK, Mesa's Vulkan driver for NVIDIA GPUs, for the Nintendo
+Switch 2. It adds a Switch 2 backend to NVK. It also provides OpenGL through
+Zink on top of NVK. Homebrew programs link it statically and run on
+libounce. The Switch 2 code and its build are in ``switch2/``. Start with
+``switch2/README.md``.
+
+Mesa's own README follows.
+
 `Mesa <https://mesa3d.org>`_ - The 3D Graphics Library
 ======================================================
-
 
 Source
 ------

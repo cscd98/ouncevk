@@ -409,6 +409,15 @@ u_printf_singleton_decref()
    simple_mtx_unlock(&u_printf_lock);
 }
 
+bool
+u_printf_singleton_is_ready(void)
+{
+   simple_mtx_lock(&u_printf_lock);
+   bool ready = u_printf_cache.users > 0 && u_printf_cache.ht != NULL;
+   simple_mtx_unlock(&u_printf_lock);
+   return ready;
+}
+
 static void
 assert_singleton_exists_and_is_locked()
 {

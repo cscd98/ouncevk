@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#if !DRI_CONF_DEFAULTS_ONLY
 #if WITH_XMLCONFIG
 #include <expat.h>
 #include <unistd.h>
@@ -55,6 +56,7 @@ static inline void regfree(regex_t* r) {}
 #else
 #include <regex.h>
 #endif
+#endif /* !DRI_CONF_DEFAULTS_ONLY */
 #include <fcntl.h>
 #include <math.h>
 #include "strndup.h"
@@ -67,6 +69,7 @@ static inline void regfree(regex_t* r) {}
 #define PATH_MAX 4096
 #endif
 
+#if !DRI_CONF_DEFAULTS_ONLY
 static bool
 be_verbose(void)
 {
@@ -284,6 +287,8 @@ parseValue(driOptionValue *v, driOptionType type, const char *string)
    return true;
 }
 
+#endif /* !DRI_CONF_DEFAULTS_ONLY */
+
 /** \brief Find an option in an option cache with the name as key */
 static uint32_t
 findOption(const driOptionCache *cache, const char *name)
@@ -385,6 +390,8 @@ driParseOptionInfo(driOptionCache *info,
       if (optinfo->name) {
          /* Duplicate options override the value, but the type must match. */
          assert(optinfo->type == opt->info.type);
+         if (optinfo->type == DRI_STRING)
+            free(optval->_string);
       } else {
          XSTRDUP(optinfo->name, name);
       }
@@ -421,6 +428,7 @@ driParseOptionInfo(driOptionCache *info,
       /* Built-in default values should always be valid. */
       assert(checkValue(optval, optinfo));
 
+#if !DRI_CONF_DEFAULTS_ONLY
       const char *envVal = os_get_option(name);
       if (envVal != NULL) {
          driOptionValue v;
@@ -436,12 +444,15 @@ driParseOptionInfo(driOptionCache *info,
                        "ATTENTION: default value of option %s overridden by environment.\n",
                        name);
             }
+            if (optinfo->type == DRI_STRING)
+               free(optval->_string);
             *optval = v;
          } else {
             fprintf(stderr, "illegal environment value for %s: \"%s\".  Ignoring.\n",
                     name, envVal);
          }
       }
+#endif /* !DRI_CONF_DEFAULTS_ONLY */
    }
 }
 
@@ -586,6 +597,7 @@ driGetOptionsXml(const driOptionDescription *configOptions, unsigned numOptions)
    return output;
 }
 
+#if !DRI_CONF_DEFAULTS_ONLY
 /**
  * Print message to \c stderr if the \c LIBGL_DEBUG environment variable
  * is set.
@@ -1303,6 +1315,7 @@ parseStaticConfig(struct OptConfData *data)
    }
 }
 #endif /* WITH_XMLCONFIG */
+#endif /* !DRI_CONF_DEFAULTS_ONLY */
 
 /** \brief Initialize an option cache based on info */
 static void
@@ -1337,6 +1350,7 @@ driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
                     const driConfigFileParseParams *params)
 {
    initOptionCache(cache, info);
+#if !DRI_CONF_DEFAULTS_ONLY
    struct OptConfData userData = {0};
 
    if (!execname)
@@ -1385,6 +1399,7 @@ driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
 #else
    parseStaticConfig(&userData);
 #endif /* WITH_XMLCONFIG */
+#endif /* !DRI_CONF_DEFAULTS_ONLY */
 }
 
 void

@@ -422,6 +422,154 @@ vk_pipeline_cache_lookup_object(struct vk_pipeline_cache *cache,
    return object;
 }
 
+/* A compile in progress of one key, in vk_pipeline_cache::compiles. */
+struct vk_pipeline_cache_compile {
+   struct list_head link;
+
+   /* The compiling thread and each thread waiting for it */
+   uint32_t users;
+   bool ended;
+
+   uint32_t key_size;
+   uint8_t key_data[];
+};
+
+/* cache->compile_lock must be held when calling */
+static struct vk_pipeline_cache_compile *
+vk_pipeline_cache_find_compile(struct vk_pipeline_cache *cache,
+                               const void *key_data, size_t key_size)
+{
+   list_for_each_entry(struct vk_pipeline_cache_compile, compile,
+                       &cache->compiles, link) {
+      if (compile->key_size == key_size &&
+          memcmp(compile->key_data, key_data, key_size) == 0)
+         return compile;
+   }
+   return NULL;
+}
+
+/* cache->compile_lock must be held when calling */
+static void
+vk_pipeline_cache_release_compile(struct vk_pipeline_cache_compile *compile)
+{
+   assert(compile->users > 0);
+   if (--compile->users == 0)
+      free(compile);
+}
+
+/* Records a compile of the key. Returns false if another thread is already
+ * compiling it, after waiting for that compile to end when may_wait is set.
+ */
+static bool
+vk_pipeline_cache_try_claim(struct vk_pipeline_cache *cache,
+                            const void *key_data, size_t key_size,
+                            bool may_wait, bool *waited)
+{
+   *waited = false;
+
+   mtx_lock(&cache->compile_lock);
+   struct vk_pipeline_cache_compile *compile =
+      vk_pipeline_cache_find_compile(cache, key_data, key_size);
+
+   if (compile == NULL) {
+      compile = malloc(sizeof(*compile) + key_size);
+      if (compile == NULL) {
+         /* Compile without recording it; another thread may compile the
+          * same object.
+          */
+         mtx_unlock(&cache->compile_lock);
+         return false;
+      }
+
+      compile->users = 1;
+      compile->ended = false;
+      compile->key_size = key_size;
+      memcpy(compile->key_data, key_data, key_size);
+      list_addtail(&compile->link, &cache->compiles);
+      mtx_unlock(&cache->compile_lock);
+      return true;
+   }
+
+   if (may_wait) {
+      compile->users++;
+      while (!compile->ended)
+         cnd_wait(&cache->compile_done, &cache->compile_lock);
+      vk_pipeline_cache_release_compile(compile);
+      *waited = true;
+   }
+
+   mtx_unlock(&cache->compile_lock);
+   return false;
+}
+
+struct vk_pipeline_cache_object *
+vk_pipeline_cache_lookup_or_claim(struct vk_pipeline_cache *cache,
+                                  const void *key_data, size_t key_size,
+                                  const struct vk_pipeline_cache_object_ops *ops,
+                                  bool *cache_hit, bool may_wait,
+                                  bool *claimed)
+{
+   assert(cache != NULL);
+   *claimed = false;
+
+   bool waited = false;
+   for (;;) {
+      bool hit = false;
+      struct vk_pipeline_cache_object *object =
+         vk_pipeline_cache_lookup_object(cache, key_data, key_size, ops, &hit);
+      if (cache_hit != NULL)
+         *cache_hit = hit && !waited;
+      if (object != NULL)
+         return object;
+
+      /* Without an object cache, a thread that waited could not find the
+       * object that the other thread compiled.
+       */
+      if (cache->object_cache == NULL)
+         return NULL;
+
+      if (vk_pipeline_cache_try_claim(cache, key_data, key_size,
+                                      may_wait, &waited))
+         break;
+
+      /* The other thread's compile ended, or it failed: look again. A
+       * thread that may not wait compiles the object itself.
+       */
+      if (!waited)
+         return NULL;
+   }
+
+   /* The other thread may have added the object and ended its compile
+    * between our lookup and our claim.
+    */
+   struct vk_pipeline_cache_object *object =
+      vk_pipeline_cache_lookup_object(cache, key_data, key_size, ops, NULL);
+   if (object != NULL) {
+      vk_pipeline_cache_end_compile(cache, key_data, key_size);
+      return object;
+   }
+
+   *claimed = true;
+   return NULL;
+}
+
+void
+vk_pipeline_cache_end_compile(struct vk_pipeline_cache *cache,
+                              const void *key_data, size_t key_size)
+{
+   mtx_lock(&cache->compile_lock);
+   struct vk_pipeline_cache_compile *compile =
+      vk_pipeline_cache_find_compile(cache, key_data, key_size);
+   assert(compile != NULL);
+   if (compile != NULL) {
+      list_del(&compile->link);
+      compile->ended = true;
+      vk_pipeline_cache_release_compile(compile);
+      cnd_broadcast(&cache->compile_done);
+   }
+   mtx_unlock(&cache->compile_lock);
+}
+
 struct vk_pipeline_cache_object *
 vk_pipeline_cache_add_object(struct vk_pipeline_cache *cache,
                              struct vk_pipeline_cache_object *object)
@@ -652,6 +800,9 @@ vk_pipeline_cache_create(struct vk_device *device,
    memcpy(cache->header.uuid, pdevice_props.pipelineCacheUUID, VK_UUID_SIZE);
 
    simple_mtx_init(&cache->lock, mtx_plain);
+   mtx_init(&cache->compile_lock, mtx_plain);
+   cnd_init(&cache->compile_done);
+   list_inithead(&cache->compiles);
 
    if (info->force_enable ||
        debug_get_bool_option("VK_ENABLE_PIPELINE_CACHE", true)) {
@@ -681,6 +832,9 @@ vk_pipeline_cache_destroy(struct vk_pipeline_cache *cache,
       }
       _mesa_set_destroy(cache->object_cache, NULL);
    }
+   assert(list_is_empty(&cache->compiles));
+   cnd_destroy(&cache->compile_done);
+   mtx_destroy(&cache->compile_lock);
    simple_mtx_destroy(&cache->lock);
    vk_object_free(cache->base.device, pAllocator, cache);
 }

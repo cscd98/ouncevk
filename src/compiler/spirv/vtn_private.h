@@ -629,7 +629,7 @@ struct vtn_builder {
    uint32_t version;
 
    nir_shader *shader;
-   struct spirv_to_nir_options *options;
+   const struct spirv_to_nir_options *options;
    struct vtn_block *block;
 
    /* Current offset, file, line, and column.  Useful for debugging.  Set

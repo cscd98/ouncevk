@@ -32,6 +32,11 @@ struct nvk_queue_state {
       uint32_t bytes_per_warp;
       uint32_t bytes_per_tpc;
    } slm;
+
+   /* A copy of the context init words, for the channel state replay (see
+    * nvkmd_ctx_set_state_replay). */
+   uint32_t *init_words;
+   uint32_t init_word_count;
 };
 
 struct nvk_queue {

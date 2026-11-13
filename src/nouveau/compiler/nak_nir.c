@@ -157,6 +157,7 @@ phi_vectorize_cb(const nir_instr *instr, const void *data)
 void
 nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
 {
+   const uint64_t timing_start = nir_pass_timing_begin();
    bool progress;
    struct set *skip = _mesa_pointer_set_create(NULL);
 
@@ -245,6 +246,7 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
    OPT(nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
    _mesa_set_destroy(skip, NULL);
+   nir_pass_timing_end("phase: nak_optimize_nir", timing_start);
 }
 
 static unsigned
@@ -372,6 +374,7 @@ lower_bit_size_cb(const nir_instr *instr, void *data)
 void
 nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
 {
+   const uint64_t timing_start = nir_pass_timing_begin();
    UNUSED bool progress = false;
 
    nir_validate_ssa_dominance(nir, "before nak_preprocess_nir");
@@ -414,6 +417,7 @@ nak_preprocess_nir(nir_shader *nir, const struct nak_compiler *nak)
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       OPT(nir, nir_lower_terminate_to_demote);
+   nir_pass_timing_end("phase: nak_preprocess_nir", timing_start);
 }
 
 uint16_t
@@ -1557,6 +1561,7 @@ nak_postprocess_nir(nir_shader *nir,
                     const struct nak_fs_key *fs_key,
                     bool has_task_shader)
 {
+   const uint64_t timing_start = nir_pass_timing_begin();
    UNUSED bool progress = false;
 
    const bool is_mesh_stage = nir->info.stage == MESA_SHADER_TASK ||
@@ -1857,4 +1862,5 @@ nak_postprocess_nir(nir_shader *nir,
               _mesa_shader_stage_to_string(nir->info.stage));
       nir_print_shader(nir, stderr);
    }
+   nir_pass_timing_end("phase: nak_postprocess_nir", timing_start);
 }

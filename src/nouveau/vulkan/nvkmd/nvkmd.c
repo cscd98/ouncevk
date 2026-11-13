@@ -4,7 +4,14 @@
  */
 
 #include "nvkmd.h"
+
+#include "util/detect_os.h"
+
+#if DETECT_OS_HORIZON
+#include "nvgpu/nvkmd_nvgpu_discovery.h"
+#else
 #include "nouveau/nvkmd_nouveau.h"
+#endif
 #include "nv_push.h"
 #include "util/cache_ops.h"
 #include "util/u_math.h"
@@ -12,7 +19,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 
-static void
+void
 nvkmd_dev_add_mem(struct nvkmd_dev *dev,
                   struct nvkmd_mem *mem)
 {
@@ -88,9 +95,23 @@ nvkmd_try_create_pdev_for_drm(struct _drmDevice *drm_device,
                               enum nvk_debug debug_flags,
                               struct nvkmd_pdev **pdev_out)
 {
+#if DETECT_OS_HORIZON
+   return VK_ERROR_INCOMPATIBLE_DRIVER;
+#else
    return nvkmd_nouveau_try_create_pdev(drm_device, log_obj,
                                         debug_flags, pdev_out);
+#endif
 }
+
+#if DETECT_OS_HORIZON
+VkResult
+nvkmd_try_create_pdev(struct vk_object_base *log_obj,
+                      enum nvk_debug debug_flags,
+                      struct nvkmd_pdev **pdev_out)
+{
+   return nvkmd_nvgpu_try_create_pdev(log_obj, debug_flags, pdev_out);
+}
+#endif
 
 VkResult MUST_CHECK
 nvkmd_dev_alloc_mem(struct nvkmd_dev *dev,
@@ -158,6 +179,24 @@ nvkmd_dev_import_dma_buf(struct nvkmd_dev *dev,
                          int fd, struct nvkmd_mem **mem_out)
 {
    VkResult result = dev->ops->import_dma_buf(dev, log_obj, fd, mem_out);
+   if (result == VK_SUCCESS)
+      nvkmd_dev_add_mem(dev, *mem_out);
+
+   return result;
+}
+
+VkResult MUST_CHECK
+nvkmd_dev_import_host_ptr(struct nvkmd_dev *dev,
+                          struct vk_object_base *log_obj,
+                          void *host_ptr, uint64_t size_B,
+                          enum nvkmd_mem_flags flags,
+                          struct nvkmd_mem **mem_out)
+{
+   if (dev->ops->import_host_ptr == NULL)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   VkResult result = dev->ops->import_host_ptr(dev, log_obj, host_ptr, size_B,
+                                               flags, mem_out);
    if (result == VK_SUCCESS)
       nvkmd_dev_add_mem(dev, *mem_out);
 
@@ -454,12 +493,21 @@ void
 nvkmd_mem_sync_to_gpu(struct nvkmd_mem *mem, bool client_map,
                       uint64_t offset_B, uint64_t range_B)
 {
-   if (mem->flags & NVKMD_MEM_COHERENT)
+   if (!nvkmd_mem_is_cpu_cacheable(mem))
       return;
 
    const uint32_t atom_size_B = mem->dev->pdev->dev_info.nc_atom_size_B;
    assert(util_is_aligned(offset_B, atom_size_B));
    assert(util_is_aligned(range_B, atom_size_B));
+
+#ifdef NVK_NATIVE_HEADLESS
+   /* The backend synchronizes the native mode-2 backing with its own
+    * full-system barrier policy. This registration does not use generic
+    * AArch64 cache operations.
+    */
+   mem->ops->sync_to_gpu(mem, offset_B, range_B);
+   return;
+#endif
 
    if (util_has_cache_ops()) {
       void *map = client_map ? mem->client_map : mem->map;
@@ -473,12 +521,17 @@ void
 nvkmd_mem_sync_from_gpu(struct nvkmd_mem *mem, bool client_map,
                         uint64_t offset_B, uint64_t range_B)
 {
-   if (mem->flags & NVKMD_MEM_COHERENT)
+   if (!nvkmd_mem_is_cpu_cacheable(mem))
       return;
 
    const uint32_t atom_size_B = mem->dev->pdev->dev_info.nc_atom_size_B;
    assert(util_is_aligned(offset_B, atom_size_B));
    assert(util_is_aligned(range_B, atom_size_B));
+
+#ifdef NVK_NATIVE_HEADLESS
+   mem->ops->sync_from_gpu(mem, offset_B, range_B);
+   return;
+#endif
 
    if (util_has_cache_ops()) {
       void *map = client_map ? mem->client_map : mem->map;

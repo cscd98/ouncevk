@@ -47,6 +47,22 @@
 
 #include "util/mesa-blake3.h"
 
+/* Optional diagnostic hook that reports compute pipeline creation stages.
+ * Mesa's normal path has no observer. */
+void ouncevk_switch2_pipeline_set_observer(void (*observer)(uint32_t));
+static void (*ouncevk_pipeline_observer)(uint32_t);
+
+void
+ouncevk_switch2_pipeline_set_observer(void (*observer)(uint32_t))
+{
+   ouncevk_pipeline_observer = observer;
+}
+
+#define OUNCEVK_PIPELINE_STAGE(stage) do {                                  \
+   if (ouncevk_pipeline_observer)                                             \
+      ouncevk_pipeline_observer(stage);                                       \
+} while (0)
+
 struct vk_pipeline_binary {
    struct vk_object_base base;
 
@@ -916,33 +932,16 @@ vk_pipeline_hash_precomp_shader_stage(struct vk_device *device,
                                         &rs, stage->precomp_key);
 }
 
+/* Translates the stage's SPIR-V to NIR and makes stage->precomp from it. */
 static VkResult
-vk_pipeline_precompile_shader(struct vk_device *device,
-                              struct vk_pipeline_cache *cache,
-                              VkPipelineCreateFlags2KHR pipeline_flags,
-                              const void *pipeline_info_pNext,
-                              const VkPipelineShaderStageCreateInfo *info,
-                              struct vk_pipeline_stage *stage)
+vk_pipeline_create_precomp_shader(struct vk_device *device,
+                                  VkPipelineCreateFlags2KHR pipeline_flags,
+                                  const void *pipeline_info_pNext,
+                                  const VkPipelineShaderStageCreateInfo *info,
+                                  struct vk_pipeline_stage *stage)
 {
    const struct vk_device_shader_ops *ops = device->shader_ops;
    VkResult result;
-
-   if (cache != NULL) {
-      struct vk_pipeline_cache_object *cache_obj =
-         vk_pipeline_cache_lookup_object(cache,
-                                         stage->precomp_key,
-                                         sizeof(stage->precomp_key),
-                                         &pipeline_precomp_shader_cache_ops,
-                                         NULL /* cache_hit */);
-      if (cache_obj != NULL) {
-         stage->precomp = vk_pipeline_precomp_shader_from_cache_obj(cache_obj);
-         return VK_SUCCESS;
-      }
-   }
-
-   if (pipeline_flags &
-       VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
-      return VK_PIPELINE_COMPILE_REQUIRED;
 
    struct vk_pipeline_robustness_state rs;
    vk_pipeline_robustness_state_fill(&device->robustness_state, &rs,
@@ -988,13 +987,62 @@ vk_pipeline_precompile_shader(struct vk_device *device,
    if (stage->precomp == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   return VK_SUCCESS;
+}
+
+static VkResult
+vk_pipeline_precompile_shader(struct vk_device *device,
+                              struct vk_pipeline_cache *cache,
+                              VkPipelineCreateFlags2KHR pipeline_flags,
+                              const void *pipeline_info_pNext,
+                              const VkPipelineShaderStageCreateInfo *info,
+                              struct vk_pipeline_stage *stage)
+{
+   const bool fail_on_compile = pipeline_flags &
+      VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR;
+
+   /* If another pipeline is translating the same stage, wait for it rather
+    * than translate it again. A pipeline that may not compile does not wait.
+    */
+   bool claimed = false;
    if (cache != NULL) {
+      struct vk_pipeline_cache_object *cache_obj = fail_on_compile ?
+         vk_pipeline_cache_lookup_object(cache,
+                                         stage->precomp_key,
+                                         sizeof(stage->precomp_key),
+                                         &pipeline_precomp_shader_cache_ops,
+                                         NULL /* cache_hit */) :
+         vk_pipeline_cache_lookup_or_claim(cache,
+                                           stage->precomp_key,
+                                           sizeof(stage->precomp_key),
+                                           &pipeline_precomp_shader_cache_ops,
+                                           NULL /* cache_hit */,
+                                           true /* may_wait */, &claimed);
+      if (cache_obj != NULL) {
+         stage->precomp = vk_pipeline_precomp_shader_from_cache_obj(cache_obj);
+         return VK_SUCCESS;
+      }
+   }
+
+   if (fail_on_compile)
+      return VK_PIPELINE_COMPILE_REQUIRED;
+
+   VkResult result =
+      vk_pipeline_create_precomp_shader(device, pipeline_flags,
+                                        pipeline_info_pNext, info, stage);
+
+   if (result == VK_SUCCESS && cache != NULL) {
       struct vk_pipeline_cache_object *cache_obj = &stage->precomp->cache_obj;
       cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
       stage->precomp = vk_pipeline_precomp_shader_from_cache_obj(cache_obj);
    }
 
-   return VK_SUCCESS;
+   if (claimed) {
+      vk_pipeline_cache_end_compile(cache, stage->precomp_key,
+                                    sizeof(stage->precomp_key));
+   }
+
+   return result;
 }
 
 static VkResult
@@ -1614,6 +1662,21 @@ vk_release_graphics_pipeline_compile_info(struct vk_graphics_pipeline_compile_in
       vk_pipeline_stage_finish(device, &info->stages[i]);
 }
 
+/* Ends the compiles claimed for the stages of a partition, which start at
+ * stage first: bit i of claimed_stages is stage first + i.
+ */
+static void
+vk_graphics_pipeline_end_compiles(struct vk_pipeline_cache *cache,
+                                  struct vk_graphics_pipeline_compile_info *compile_info,
+                                  uint32_t first, uint32_t claimed_stages)
+{
+   u_foreach_bit(i, claimed_stages) {
+      const struct vk_pipeline_stage *stage = &compile_info->stages[first + i];
+      vk_pipeline_cache_end_compile(cache, &stage->shader_key,
+                                    sizeof(stage->shader_key));
+   }
+}
+
 static VkResult
 vk_graphics_pipeline_compile_shaders(struct vk_device *device,
                                      struct vk_pipeline_cache *cache,
@@ -1667,8 +1730,17 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
       vk_pipeline_tess_info_merge(&tess_info, &tes_precomp->tess);
    }
 
+   const bool fail_on_compile = pipeline_flags &
+      VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR;
+
    for (uint32_t p = 0; p < compile_info->part_count; p++) {
       const int64_t part_start = os_time_get_nano();
+      const uint32_t first = compile_info->partition[p];
+
+      /* Stages whose compile this pipeline claimed in the cache, as bits
+       * from stage first. Every return ends them.
+       */
+      uint32_t claimed_stages = 0;
 
       /* Don't try to re-compile any fast-link shaders */
       if (!compile_info->optimize &&
@@ -1719,12 +1791,27 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
                stage->shader = NULL;
             }
 
+            /* If another pipeline is compiling this shader, wait for it
+             * rather than compile it again. A pipeline that already claimed
+             * a stage does not wait, so that no two pipelines wait for each
+             * other.
+             */
             bool cache_hit = false;
-            struct vk_pipeline_cache_object *cache_obj =
+            bool claimed = false;
+            struct vk_pipeline_cache_object *cache_obj = fail_on_compile ?
                vk_pipeline_cache_lookup_object(cache, &stage->shader_key,
                                                sizeof(stage->shader_key),
                                                &pipeline_shader_cache_ops,
-                                               &cache_hit);
+                                               &cache_hit) :
+               vk_pipeline_cache_lookup_or_claim(cache, &stage->shader_key,
+                                                 sizeof(stage->shader_key),
+                                                 &pipeline_shader_cache_ops,
+                                                 &cache_hit,
+                                                 claimed_stages == 0,
+                                                 &claimed);
+            if (claimed)
+               claimed_stages |= BITFIELD_BIT(i - first);
+
             if (cache_obj != NULL) {
                assert(stage->shader == NULL);
                stage->shader = vk_shader_from_cache_obj(cache_obj);
@@ -1760,8 +1847,7 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
          }
       }
 
-      if (pipeline_flags &
-          VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+      if (fail_on_compile)
          return VK_PIPELINE_COMPILE_REQUIRED;
 
       struct vk_shader_compile_info infos[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES];
@@ -1800,8 +1886,10 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
             vk_pipeline_precomp_shader_get_nir(stage->precomp, nir_options);
          if (nir == NULL) {
             for (uint32_t j = compile_info->partition[p]; j < i; j++)
-               ralloc_free(infos[i].nir);
+               ralloc_free(infos[j].nir);
 
+            vk_graphics_pipeline_end_compiles(cache, compile_info, first,
+                                              claimed_stages);
             return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
          }
 
@@ -1838,8 +1926,11 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
                                   compile_info->state, &device->enabled_features,
                                   &device->alloc,
                                   &shaders[compile_info->partition[p]]);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         vk_graphics_pipeline_end_compiles(cache, compile_info, first,
+                                           claimed_stages);
          return result;
+      }
 
       const int64_t part_end = os_time_get_nano();
       for (uint32_t i = compile_info->partition[p]; i < compile_info->partition[p + 1]; i++) {
@@ -1870,6 +1961,9 @@ vk_graphics_pipeline_compile_shaders(struct vk_device *device,
 
          stage_feedbacks[stage->stage].duration += part_end - part_start;
       }
+
+      vk_graphics_pipeline_end_compiles(cache, compile_info, first,
+                                        claimed_stages);
    }
 
    return VK_SUCCESS;
@@ -2404,32 +2498,15 @@ vk_get_compute_pipeline_compile_info(struct vk_pipeline_stage *stage,
    }
 }
 
+/* Compiles the stage's shader into stage->shader, without the cache. */
 static VkResult
-vk_pipeline_compile_compute_stage(struct vk_device *device,
-                                  struct vk_pipeline_cache *cache,
+vk_pipeline_create_compute_shader(struct vk_device *device,
                                   struct vk_compute_pipeline *pipeline,
                                   struct vk_pipeline_layout *pipeline_layout,
-                                  struct vk_pipeline_stage *stage,
-                                  bool *cache_hit)
+                                  struct vk_pipeline_stage *stage)
 {
    const struct vk_device_shader_ops *ops = device->shader_ops;
    VkResult result;
-
-   if (cache != NULL) {
-      struct vk_pipeline_cache_object *cache_obj =
-         vk_pipeline_cache_lookup_object(cache, stage->shader_key,
-                                         sizeof(stage->shader_key),
-                                         &pipeline_shader_cache_ops,
-                                         cache_hit);
-      if (cache_obj != NULL) {
-         stage->shader = vk_shader_from_cache_obj(cache_obj);
-         return VK_SUCCESS;
-      }
-   }
-
-   if (pipeline->base.flags &
-       VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
-      return VK_PIPELINE_COMPILE_REQUIRED;
 
    const struct nir_shader_compiler_options *nir_options =
       ops->get_nir_options(device->physical, stage->stage,
@@ -2474,14 +2551,61 @@ vk_pipeline_compile_compute_stage(struct vk_device *device,
 
    vk_shader_init_cache_obj(device, shader, &stage->shader_key,
                             sizeof(stage->shader_key));
-
-   struct vk_pipeline_cache_object *cache_obj = &shader->pipeline.cache_obj;
-   if (cache != NULL)
-      cache_obj = vk_pipeline_cache_add_object(cache, cache_obj);
-
-   stage->shader = vk_shader_from_cache_obj(cache_obj);
+   stage->shader = shader;
 
    return VK_SUCCESS;
+}
+
+static VkResult
+vk_pipeline_compile_compute_stage(struct vk_device *device,
+                                  struct vk_pipeline_cache *cache,
+                                  struct vk_compute_pipeline *pipeline,
+                                  struct vk_pipeline_layout *pipeline_layout,
+                                  struct vk_pipeline_stage *stage,
+                                  bool *cache_hit)
+{
+   const bool fail_on_compile = pipeline->base.flags &
+      VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR;
+
+   /* If another pipeline is compiling this shader, wait for it rather than
+    * compile it again. A pipeline that may not compile does not wait.
+    */
+   bool claimed = false;
+   if (cache != NULL) {
+      struct vk_pipeline_cache_object *cache_obj = fail_on_compile ?
+         vk_pipeline_cache_lookup_object(cache, stage->shader_key,
+                                         sizeof(stage->shader_key),
+                                         &pipeline_shader_cache_ops,
+                                         cache_hit) :
+         vk_pipeline_cache_lookup_or_claim(cache, stage->shader_key,
+                                           sizeof(stage->shader_key),
+                                           &pipeline_shader_cache_ops,
+                                           cache_hit, true /* may_wait */,
+                                           &claimed);
+      if (cache_obj != NULL) {
+         stage->shader = vk_shader_from_cache_obj(cache_obj);
+         return VK_SUCCESS;
+      }
+   }
+
+   if (fail_on_compile)
+      return VK_PIPELINE_COMPILE_REQUIRED;
+
+   VkResult result = vk_pipeline_create_compute_shader(device, pipeline,
+                                                       pipeline_layout, stage);
+
+   if (result == VK_SUCCESS && cache != NULL) {
+      struct vk_pipeline_cache_object *cache_obj =
+         vk_pipeline_cache_add_object(cache, &stage->shader->pipeline.cache_obj);
+      stage->shader = vk_shader_from_cache_obj(cache_obj);
+   }
+
+   if (claimed) {
+      vk_pipeline_cache_end_compile(cache, stage->shader_key,
+                                    sizeof(stage->shader_key));
+   }
+
+   return result;
 }
 
 static VkResult
@@ -2562,12 +2686,15 @@ vk_create_compute_pipeline(struct vk_device *device,
                            const VkAllocationCallbacks *pAllocator,
                            VkPipeline *pPipeline)
 {
+   OUNCEVK_PIPELINE_STAGE(600);
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, pCreateInfo->layout);
    int64_t pipeline_start = os_time_get_nano();
+   OUNCEVK_PIPELINE_STAGE(601);
    VkResult result;
 
    struct vk_pipeline_stage stage;
    vk_get_compute_pipeline_compile_info(&stage, device, pCreateInfo);
+   OUNCEVK_PIPELINE_STAGE(602);
 
    const VkPipelineCreateFlags2KHR pipeline_flags =
       vk_compute_pipeline_create_flags(pCreateInfo);
@@ -2588,6 +2715,7 @@ vk_create_compute_pipeline(struct vk_device *device,
       result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto fail_stage;
    }
+   OUNCEVK_PIPELINE_STAGE(603);
 
    pipeline->base.stages = VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -2600,16 +2728,20 @@ vk_create_compute_pipeline(struct vk_device *device,
       if (result != VK_SUCCESS)
          goto fail_pipeline;
    } else {
+      OUNCEVK_PIPELINE_STAGE(604);
       result = vk_pipeline_precompile_shader(device, cache, pipeline_flags,
                                              pCreateInfo->pNext,
                                              &pCreateInfo->stage,
                                              &stage);
+      OUNCEVK_PIPELINE_STAGE(605);
       if (result != VK_SUCCESS)
          goto fail_pipeline;
 
+      OUNCEVK_PIPELINE_STAGE(606);
       result = vk_pipeline_compile_compute_stage(device, cache, pipeline,
                                                  pipeline_layout, &stage,
                                                  &cache_hit);
+      OUNCEVK_PIPELINE_STAGE(607);
       if (result != VK_SUCCESS)
          goto fail_pipeline;
    }
@@ -2656,6 +2788,7 @@ vk_common_CreateComputePipelines(VkDevice _device,
                                  const VkAllocationCallbacks *pAllocator,
                                  VkPipeline *pPipelines)
 {
+   OUNCEVK_PIPELINE_STAGE(599);
    VK_FROM_HANDLE(vk_device, device, _device);
    VK_FROM_HANDLE(vk_pipeline_cache, cache, pipelineCache);
    VkResult first_error_or_success = VK_SUCCESS;

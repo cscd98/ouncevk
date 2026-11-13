@@ -330,6 +330,49 @@ struct wsi_headless_swapchain {
 VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_headless_swapchain, base.base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
 
+#if defined(VK_USE_PLATFORM_VI_NN) && defined(NVK_NATIVE_HEADLESS) && \
+    defined(NVK_NATIVE_BACKING_ENABLED)
+/* The native game backend has GPU image memory but cannot export a DRM fd.
+ * Its headless benchmark images use ordinary local allocations without a
+ * display import. This function uses the same Vulkan image allocator as the
+ * visible swapchain. */
+static VkResult
+wsi_native_headless_create_memory(const struct wsi_swapchain *chain,
+                                  const struct wsi_image_info *info,
+                                  struct wsi_image *image)
+{
+   VkMemoryRequirements req;
+   chain->wsi->GetImageMemoryRequirements(chain->device, image->image, &req);
+   /* Use the same host-coherent (GPU-uncached) pool as the visible VI2
+    * swapchain, so headless rendering measures the same target memory. */
+   uint32_t type = 0;
+   while (type < chain->wsi->memory_props.memoryTypeCount &&
+          (!(req.memoryTypeBits & (1u << type)) ||
+           !(chain->wsi->memory_props.memoryTypes[type].propertyFlags &
+             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)))
+      type++;
+   if (type == chain->wsi->memory_props.memoryTypeCount || req.size > UINT32_MAX)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   const VkMemoryDedicatedAllocateInfo dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = image->image,
+   };
+   const VkMemoryAllocateInfo alloc = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated,
+      .allocationSize = req.size,
+      .memoryTypeIndex = type,
+   };
+   VkResult result = chain->wsi->AllocateMemory(chain->device, &alloc,
+                                                &chain->alloc, &image->memory);
+   if (result == VK_SUCCESS) {
+      image->num_planes = 1;
+      image->sizes[0] = req.size;
+   }
+   return result;
+}
+#endif
+
 static struct wsi_image *
 wsi_headless_swapchain_get_wsi_image(struct wsi_swapchain *wsi_chain,
                                      uint32_t image_index)
@@ -490,6 +533,13 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    struct wsi_base_image_params *image_params = NULL;
    struct wsi_cpu_image_params cpu_params;
    struct wsi_drm_image_params drm_params;
+#if defined(VK_USE_PLATFORM_VI_NN) && defined(NVK_NATIVE_HEADLESS) && \
+    defined(NVK_NATIVE_BACKING_ENABLED)
+   cpu_params = (struct wsi_cpu_image_params) {
+      .base.image_type = WSI_IMAGE_TYPE_CPU,
+   };
+   image_params = &cpu_params.base;
+#else
    if (wsi_device->sw) {
       cpu_params = (struct wsi_cpu_image_params) {
          .base.image_type = WSI_IMAGE_TYPE_CPU,
@@ -505,6 +555,7 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       };
       image_params = &drm_params.base;
    }
+#endif
 
    result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                pCreateInfo, image_params, pAllocator);
@@ -514,6 +565,22 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
 
    if (result != VK_SUCCESS)
       goto fail_free_chain;
+
+#if defined(VK_USE_PLATFORM_VI_NN) && defined(NVK_NATIVE_HEADLESS) && \
+    defined(NVK_NATIVE_BACKING_ENABLED)
+   /* The generic CPU WSI configures a host blit. This native device uses the
+    * same optimal GPU image path as its VI2 window, without a CPU or DRM blit. */
+   chain->base.blit.type = WSI_SWAPCHAIN_NO_BLIT;
+   wsi_destroy_image_info(&chain->base, &chain->base.image_info);
+   result = wsi_configure_image(&chain->base, pCreateInfo, 0,
+                                &chain->base.image_info);
+   if (result != VK_SUCCESS) {
+      wsi_swapchain_finish(&chain->base);
+      goto fail_free_chain;
+   }
+   chain->base.image_info.create_mem = wsi_native_headless_create_memory;
+   chain->base.image_info.finish_create = NULL;
+#endif
 
    chain->base.destroy = wsi_headless_swapchain_destroy;
    chain->base.get_wsi_image = wsi_headless_swapchain_get_wsi_image;

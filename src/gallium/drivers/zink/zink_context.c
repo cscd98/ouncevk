@@ -285,6 +285,14 @@ zink_get_device_reset_status(struct pipe_context *pctx)
 
    enum pipe_reset_status status = PIPE_NO_RESET;
 
+   /* post_submit() calls the reset callback once and records the loss only
+    * on the screen. Copy that state to the context here. Otherwise every poll
+    * after the first one returns NO_RESET for a device that is still lost.
+    * That causes a crash when the application closes.
+    */
+   if (zink_screen(ctx->base.screen)->device_lost)
+      ctx->is_device_lost = true;
+
    if (ctx->is_device_lost) {
       // Since we don't know what really happened to the hardware, just
       // assume that we are in the wrong
@@ -1203,7 +1211,7 @@ zink_create_sampler_view(struct pipe_context *pctx, struct pipe_resource *pres,
       mesa_loge("ZINK: failed to allocate sampler_view!");
       return NULL;
    }
-      
+
    sampler_view->base = *state;
    sampler_view->base.texture = NULL;
    pipe_resource_reference(&sampler_view->base.texture, pres);
@@ -1806,7 +1814,7 @@ zink_set_constant_buffer_internal(struct pipe_context *pctx,
 
       if (index + 1 >= ctx->di.num_ubos[shader])
          ctx->di.num_ubos[shader] = index + 1;
-      
+
       if (use_db) {
          update_descriptor_state_ubo_db(ctx, shader, index, new_res);
       } else {
@@ -2066,7 +2074,7 @@ unbind_shader_image(struct zink_context *ctx, mesa_shader_stage stage, unsigned 
    res->image_binds[stage] &= ~BITFIELD_BIT(slot);
    if (!res->write_bind_count[is_compute])
       res->barrier_access[stage == MESA_SHADER_COMPUTE] &= ~VK_ACCESS_SHADER_WRITE_BIT;
-   
+
    if (image_view->import2d) {
       unbind_buffer_descriptor_stage(res, stage);
       unbind_buffer_descriptor_reads(res, stage == MESA_SHADER_COMPUTE);
@@ -4045,6 +4053,11 @@ static void
 flush_batch(struct zink_context *ctx, bool sync)
 {
    assert(!ctx->unordered_blitting);
+   if (unlikely(!ctx->bs)) {
+      /* an earlier flush could not get a new batch state */
+      check_device_lost(ctx);
+      return;
+   }
    if (ctx->clears_enabled)
       /* start rp to do all the clears */
       zink_flush_clears(ctx);
@@ -4063,6 +4076,11 @@ flush_batch(struct zink_context *ctx, bool sync)
    } else {
       struct zink_screen *screen = zink_screen(ctx->base.screen);
       zink_start_batch(ctx);
+      if (unlikely(!ctx->bs)) {
+         check_device_lost(ctx);
+         util_queue_fence_signal(&ctx->flush_fence);
+         return;
+      }
       if (screen->info.have_EXT_transform_feedback && ctx->num_so_targets)
          ctx->dirty_so_targets = true;
       memset(ctx->pipeline_changed, 1, sizeof(ctx->pipeline_changed));
@@ -4457,6 +4475,14 @@ zink_flush(struct pipe_context *pctx,
    struct zink_batch_state *bs = NULL;
    struct zink_screen *screen = zink_screen(ctx->base.screen);
    VkSemaphore export_sem = VK_NULL_HANDLE;
+
+   if (unlikely(!ctx->bs)) {
+      /* an earlier flush could not get a new batch state */
+      check_device_lost(ctx);
+      if (pfence)
+         *pfence = NULL;
+      return;
+   }
 
    /* triggering clears will force state->has_work */
    if (!deferred && ctx->clears_enabled) {
@@ -5122,7 +5148,7 @@ zink_copy_buffer(struct zink_context *ctx, struct zink_resource *dst, struct zin
       zink_screen(ctx->base.screen)->buffer_barrier(ctx, src, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
    bool unordered_dst = zink_resource_buffer_transfer_dst_barrier(ctx, dst, dst_offset, size);
    bool can_unorder = unordered_dst && unordered_src && !ctx->no_reorder;
-   VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf : 
+   VkCommandBuffer cmdbuf = unsync ? ctx->bs->unsynchronized_cmdbuf :
                                      can_unorder ? ctx->bs->reordered_cmdbuf : zink_get_cmdbuf(ctx, src, dst);
    ctx->bs->has_reordered_work |= can_unorder;
    ctx->bs->has_unsync |= unsync;

@@ -68,6 +68,11 @@ void util_vma_heap_free(struct util_vma_heap *heap,
 
 uint64_t util_vma_heap_get_max_free_continuous_size(struct util_vma_heap *heap);
 
+/** Gives the free range with the lowest address. Returns false when no
+ * range is free. */
+bool util_vma_heap_get_lowest_hole(struct util_vma_heap *heap,
+                                   uint64_t *offset, uint64_t *size);
+
 void util_vma_heap_print(struct util_vma_heap *heap, FILE *fp,
                          const char *tab, uint64_t total_size);
 
