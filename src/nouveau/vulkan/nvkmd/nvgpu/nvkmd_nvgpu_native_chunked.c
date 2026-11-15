@@ -156,15 +156,14 @@ native_chunk_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
    owner->free_chunk_count++;
 }
 
-/* A hold with one reference, the allocation's. NULL when there is no
- * memory. */
+/* A hold with one reference, the allocation's, for a VA that the caller
+ * reserves next. NULL when there is no memory. */
 static struct nvkmd_nvgpu_native_va_hold *
-native_va_hold_create(uint64_t addr, uint64_t size_B)
+native_va_hold_create(uint64_t size_B)
 {
    struct nvkmd_nvgpu_native_va_hold *hold = calloc(1, sizeof(*hold));
    if (!hold)
       return NULL;
-   hold->addr = addr;
    hold->size_B = size_B;
    hold->references = 1;
    return hold;
@@ -331,9 +330,16 @@ nvkmd_nvgpu_native_chunked_mem_create(
    const uint32_t count = (uint32_t)count64;
    struct nvkmd_nvgpu_native_chunked_mem *mem =
       calloc(1, sizeof(*mem) + count * sizeof(mem->chunks[0]));
-   if (!mem)
+   /* The hold is made before its VA is reserved, so that a VA is never
+    * reserved without the record that returns it. */
+   struct nvkmd_nvgpu_native_va_hold *hold =
+      mem ? native_va_hold_create(length_B) : NULL;
+   if (!mem || !hold) {
+      free(mem);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    if (!nvkmd_nvgpu_native_owner_lock(owner)) {
+      free(hold);
       free(mem);
       return VK_ERROR_DEVICE_LOST;
    }
@@ -341,13 +347,8 @@ nvkmd_nvgpu_native_chunked_mem_create(
    mem->owner = owner;
    const uint64_t va = nvkmd_nvgpu_native_owner_reserve_va(
       owner, length_B, MAX2(align_B, NATIVE_CHUNK_ALIGN_B));
+   hold->addr = va;
    VkResult result = va ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   struct nvkmd_nvgpu_native_va_hold *hold =
-      va ? native_va_hold_create(va, length_B) : NULL;
-   if (va && !hold) {
-      nvkmd_nvgpu_native_owner_release_va(owner, va, length_B);
-      result = VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
    uint32_t mapped = 0;
    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) {
       struct nvkmd_nvgpu_native_chunk *chunk = native_chunk_take(owner);
@@ -385,8 +386,10 @@ nvkmd_nvgpu_native_chunked_mem_create(
       mapped++;
    }
    if (result != VK_SUCCESS) {
-      if (hold)
+      if (va)
          native_chunks_unmap_release_va(owner, mem->chunks, mapped, hold);
+      else
+         free(hold);
       nvkmd_nvgpu_native_owner_unlock(owner);
       free(mem);
       return result;

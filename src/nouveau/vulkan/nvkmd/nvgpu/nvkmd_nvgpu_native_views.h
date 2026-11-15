@@ -15,6 +15,11 @@
 struct nvkmd_nvgpu_native_view {
    uint64_t offset_B, size_B;
    struct nvkmd_nvgpu_native_view_source source;
+   /* Its map or an unmap of it failed, and the program was told. The view
+    * is kept only to be unmapped. No part of it is mapped again: its
+    * mapping may be gone already, and its backing may have another user
+    * by then. */
+   bool failed;
 };
 
 /* The views of one reserved VA, and the VA. They do not overlap. Every
@@ -28,12 +33,12 @@ struct nvkmd_nvgpu_native_view_list {
    uint32_t count, capacity;
 };
 
-/* A list for a VA that the caller reserved. NULL when there is no memory.
- * The list is allocated here, with the VA object, so that the destruction
- * of the VA object needs no memory to keep a view that may still be
- * mapped. */
+/* A list for a VA of va_size_B that the caller reserves next and stores
+ * in va_addr. NULL when there is no memory. The list is allocated here,
+ * with the VA object, so that the destruction of the VA object needs no
+ * memory to keep a view that may still be mapped. */
 struct nvkmd_nvgpu_native_view_list *nvkmd_nvgpu_native_view_list_create(
-   uint64_t va_addr, uint64_t va_size_B, uint8_t pte_kind);
+   uint64_t va_size_B, uint8_t pte_kind);
 
 /* Makes room for one more view. A mapping must not exist without its view,
  * so this comes before the map request. */
@@ -51,7 +56,7 @@ VkResult nvkmd_nvgpu_native_view_list_map(
 /* Unbinds [offset_B, +size_B) of the VA. e5 removes whole mappings only,
  * so a view that the range covers in part is removed and its remaining
  * head and tail are mapped again from the same backing (remove, then a
- * distinct e3: no atomic replacement). */
+ * distinct e3: no atomic replacement). A failed view is removed whole. */
 VkResult nvkmd_nvgpu_native_view_list_unbind(
    struct nvkmd_nvgpu_native_device_owner *owner,
    struct nvkmd_nvgpu_native_view_list *list,

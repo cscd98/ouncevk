@@ -89,13 +89,11 @@ native_view_unmap(struct nvkmd_nvgpu_native_device_owner *owner,
 }
 
 struct nvkmd_nvgpu_native_view_list *
-nvkmd_nvgpu_native_view_list_create(uint64_t va_addr, uint64_t va_size_B,
-                                    uint8_t pte_kind)
+nvkmd_nvgpu_native_view_list_create(uint64_t va_size_B, uint8_t pte_kind)
 {
    struct nvkmd_nvgpu_native_view_list *list = calloc(1, sizeof(*list));
    if (!list)
       return NULL;
-   list->va_addr = va_addr;
    list->va_size_B = va_size_B;
    list->pte_kind = pte_kind;
    return list;
@@ -128,8 +126,10 @@ nvkmd_nvgpu_native_view_list_map(
    const VkResult result = nvkmd_nvgpu_native_owner_map_backing(
       owner, &view->source, view->size_B, list->va_addr + view->offset_B,
       list->pte_kind, &left_mapped);
-   if (result == VK_SUCCESS || left_mapped)
-      list->views[list->count++] = *view;
+   if (result == VK_SUCCESS || left_mapped) {
+      list->views[list->count] = *view;
+      list->views[list->count++].failed = result != VK_SUCCESS;
+   }
    return result;
 }
 
@@ -181,8 +181,9 @@ nvkmd_nvgpu_native_view_list_unbind(
       }
    }
    /* Remove every view that the range touches, as whole records. A view
-    * whose unmap failed stays whole: its mapping may remain, so nothing is
-    * mapped in its place. */
+    * whose unmap failed stays whole, marked failed: its mapping may remain,
+    * so nothing is mapped in its place. A failed view whose unmap succeeds
+    * now is only removed. */
    VkResult result = VK_SUCCESS;
    uint32_t kept = 0;
    for (uint32_t i = 0; i < list->count; i++) {
@@ -192,19 +193,23 @@ nvkmd_nvgpu_native_view_list_unbind(
       if (touched &&
           native_view_unmap(owner, view.source.backing,
                             list->va_addr + view.offset_B, view.size_B)) {
-         removed[i] = true;
+         removed[i] = !view.failed;
          continue;
       }
-      if (touched)
+      list->views[kept] = view;
+      if (touched) {
          result = VK_ERROR_DEVICE_LOST;
-      list->views[kept++] = view;
+         list->views[kept].failed = true;
+      }
+      kept++;
    }
    list->count = kept;
    /* Map the kept parts of the removed views again. */
    for (uint32_t i = 0; i < keep_count; i++) {
       if (!removed[keep_from[i]])
          continue;
-      const VkResult mapped = nvkmd_nvgpu_native_view_list_map(owner, list, &keep[i]);
+      const VkResult mapped =
+         nvkmd_nvgpu_native_view_list_map(owner, list, &keep[i]);
       if (mapped != VK_SUCCESS) {
          result = mapped;
          break;
@@ -230,8 +235,10 @@ native_view_list_unmap_all(struct nvkmd_nvgpu_native_device_owner *owner,
    for (uint32_t i = 0; i < list->count; i++) {
       const struct nvkmd_nvgpu_native_view view = list->views[i];
       if (!native_view_unmap(owner, view.source.backing,
-                             list->va_addr + view.offset_B, view.size_B))
-         list->views[kept++] = view;
+                             list->va_addr + view.offset_B, view.size_B)) {
+         list->views[kept] = view;
+         list->views[kept++].failed = true;
+      }
    }
    list->count = kept;
    return !kept;

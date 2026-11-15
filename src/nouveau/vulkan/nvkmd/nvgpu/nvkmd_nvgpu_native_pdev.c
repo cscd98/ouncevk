@@ -446,6 +446,7 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
       mem, mem_offset_B, range_B, va->base.addr + va_offset_B,
       va->views->pte_kind,
       &view.source, &left_mapped);
+   view.failed = result != VK_SUCCESS;
    if (result == VK_SUCCESS || left_mapped)
       va->views->views[va->views->count++] = view;
    return result;
@@ -531,31 +532,31 @@ native_dev_reserve_va_locked(struct nvkmd_nvgpu_native_dev *dev,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    const uint64_t reserved_B = align64(size_B, 4096);
+   /* The view list is made before its VA is reserved, so that a VA is
+    * never reserved without the record that returns it. */
    struct nvkmd_nvgpu_native_va *va = calloc(1, sizeof(*va));
-   if (va == NULL) {
+   struct nvkmd_nvgpu_native_view_list *views =
+      va ? nvkmd_nvgpu_native_view_list_create(reserved_B, pte_kind) : NULL;
+   if (va == NULL || views == NULL) {
+      free(va);
       dev->owner->last_va_result = VK_ERROR_OUT_OF_HOST_MEMORY;
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    const uint64_t addr =
       nvkmd_nvgpu_native_owner_reserve_va(dev->owner, reserved_B, align_B);
    if (!addr) {
+      free(views);
       free(va);
       dev->owner->last_va_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
+   views->va_addr = addr;
    va->base.ops = &native_va_ops;
    va->base.dev = &dev->base;
    va->base.addr = addr;
    va->base.size_B = reserved_B;
    va->dev = dev;
-   va->views = nvkmd_nvgpu_native_view_list_create(addr, reserved_B,
-                                                   pte_kind);
-   if (!va->views) {
-      nvkmd_nvgpu_native_owner_release_va(dev->owner, addr, reserved_B);
-      free(va);
-      dev->owner->last_va_result = VK_ERROR_OUT_OF_HOST_MEMORY;
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
+   va->views = views;
    dev->va_count++;
    dev->owner->active_vas++;
    *va_out = &va->base;
