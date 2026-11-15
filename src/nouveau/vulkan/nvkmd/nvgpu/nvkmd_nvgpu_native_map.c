@@ -7,6 +7,8 @@
 
 #include "util/log.h"
 
+#include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAP_PAGE_B UINT64_C(0x1000)
@@ -45,6 +47,13 @@ nvkmd_nvgpu_native_slot_close(struct nvkmd_nvgpu_native_slot *slot)
    Result rc = 0;
    if (!nvkmd_nvgpu_native_slot_settle(slot, &rc))
       return false;
+   /* Every mapping's record was retired before the slot is closed, so a
+    * record that is left here belongs to an object that was never
+    * destroyed. */
+   if (slot->unmapped_count)
+      mesa_logw("native slot: %u late unmaps were not asked for again",
+                slot->unmapped_count);
+   free(slot->unmapped);
    eventClose(&slot->event);
    memset(slot, 0, sizeof(*slot));
    return true;
@@ -87,19 +96,15 @@ slot_apply_pending(struct nvkmd_nvgpu_native_slot *slot)
       pending.backing->maps--;
       if (pending.map) {
          pending.map->mapped = false;
-      } else if (slot->unmapped_count < NVKMD_NVGPU_NATIVE_SLOT_UNMAPPED_MAX) {
+      } else {
+         /* The room was made before the unmap was sent. */
+         assert(slot->unmapped_count < slot->unmapped_capacity);
          slot->unmapped[slot->unmapped_count++] =
             (struct nvkmd_nvgpu_native_slot_unmapped) {
                .backing = pending.backing,
                .gpu_va = pending.gpu_va,
                .size_B = pending.size_B,
             };
-      } else {
-         /* Its caller will send the unmap again, for an interval that
-          * has no mapping, and keep its record when that is refused. */
-         mesa_logw("native slot: no room to record the unmap of 0x%llx "
-                   "bytes that completed late",
-                   (unsigned long long)pending.size_B);
       }
       break;
    case NVKMD_NVGPU_NATIVE_SLOT_UNREGISTER:
@@ -150,6 +155,22 @@ nvkmd_nvgpu_native_slot_finish(
    slot->pending.acceptance_unknown = R_FAILED(send_result);
    slot->pending.result = *result_out;
    return NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED;
+}
+
+/* Makes room for the record of one more range unmap that completes late. */
+static bool
+slot_reserve_unmapped(struct nvkmd_nvgpu_native_slot *slot)
+{
+   if (slot->unmapped_count < slot->unmapped_capacity)
+      return true;
+   const uint32_t capacity = slot->unmapped_capacity + 8;
+   struct nvkmd_nvgpu_native_slot_unmapped *unmapped =
+      realloc(slot->unmapped, capacity * sizeof(*unmapped));
+   if (!unmapped)
+      return false;
+   slot->unmapped = unmapped;
+   slot->unmapped_capacity = capacity;
+   return true;
 }
 
 /* Takes the record of a range unmap that completed late. */
@@ -411,6 +432,12 @@ nvkmd_nvgpu_native_unmap_range(struct nvkmd_nvgpu_native_runtime *runtime,
       return NVKMD_NVGPU_NATIVE_MAP_OK;
    if (!backing->maps)
       return NVKMD_NVGPU_NATIVE_MAP_ARGUMENT;
+   /* Without room for its record, the unmap is not sent: its completion
+    * could not be handed to this caller if it came late. */
+   if (!slot_reserve_unmapped(slot)) {
+      *result_out = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+      return NVKMD_NVGPU_NATIVE_MAP_SLOT;
+   }
    const Result rc = gsvGpuUnmap(&runtime->gpu, runtime->vm.id, gpu_va,
                                  size_B, slot->index);
    const struct nvkmd_nvgpu_native_slot_pending request = {

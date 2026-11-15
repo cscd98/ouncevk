@@ -49,8 +49,9 @@ struct nvkmd_nvgpu_native_dev {
 struct nvkmd_nvgpu_native_va {
    struct nvkmd_va base;
    struct nvkmd_nvgpu_native_dev *dev;
-   /* The memory that is bound in the VA. */
-   struct nvkmd_nvgpu_native_view_list views;
+   /* The memory that is bound in the VA. It outlives this object when a
+    * view may still be mapped. */
+   struct nvkmd_nvgpu_native_view_list *views;
 };
 
 enum {
@@ -359,7 +360,7 @@ native_va_free_locked(struct nvkmd_va *base)
       container_of(base, struct nvkmd_nvgpu_native_va, base);
    /* Unmaps the views and returns the VA to the heap. Views that may still
     * be mapped go to the owner, with the VA. */
-   nvkmd_nvgpu_native_view_list_finish(va->dev->owner, &va->views);
+   nvkmd_nvgpu_native_view_list_finish(va->dev->owner, va->views);
    assert(va->dev->va_count && va->dev->owner->active_vas);
    va->dev->va_count--;
    va->dev->owner->active_vas--;
@@ -399,7 +400,7 @@ native_va_bind_chunked_locked(struct nvkmd_nvgpu_native_va *va,
          .size_B = parts[i].size_B,
          .source = parts[i].source,
       };
-      result = nvkmd_nvgpu_native_view_list_map(va->dev->owner, &va->views,
+      result = nvkmd_nvgpu_native_view_list_map(va->dev->owner, va->views,
                                                 &view);
    }
    free(parts);
@@ -420,12 +421,12 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    /* A bind replaces what is bound in its range (Vulkan sparse binding):
     * unbind the range first. */
-   for (uint32_t i = 0; i < va->views.count; i++) {
-      const struct nvkmd_nvgpu_native_view *view = &va->views.views[i];
+   for (uint32_t i = 0; i < va->views->count; i++) {
+      const struct nvkmd_nvgpu_native_view *view = &va->views->views[i];
       if (va_offset_B < view->offset_B + view->size_B &&
           view->offset_B < va_offset_B + range_B) {
          const VkResult unbound = nvkmd_nvgpu_native_view_list_unbind(
-            va->dev->owner, &va->views, va_offset_B, range_B);
+            va->dev->owner, va->views, va_offset_B, range_B);
          if (unbound != VK_SUCCESS)
             return unbound;
          break;
@@ -434,7 +435,7 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
    if (nvkmd_nvgpu_native_mem_is_chunked(mem))
       return native_va_bind_chunked_locked(va, va_offset_B, mem,
                                            mem_offset_B, range_B);
-   if (!nvkmd_nvgpu_native_view_list_reserve(&va->views))
+   if (!nvkmd_nvgpu_native_view_list_reserve(va->views))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct nvkmd_nvgpu_native_view view = {
       .offset_B = va_offset_B,
@@ -443,10 +444,10 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
    bool left_mapped = false;
    const VkResult result = nvkmd_nvgpu_native_mem_map_view(
       mem, mem_offset_B, range_B, va->base.addr + va_offset_B,
-      va->views.pte_kind,
+      va->views->pte_kind,
       &view.source, &left_mapped);
    if (result == VK_SUCCESS || left_mapped)
-      va->views.views[va->views.count++] = view;
+      va->views->views[va->views->count++] = view;
    return result;
 }
 
@@ -492,7 +493,7 @@ native_va_unbind_locked(struct nvkmd_va *base,
    (void)log_obj;
    struct nvkmd_nvgpu_native_va *va =
       container_of(base, struct nvkmd_nvgpu_native_va, base);
-   return nvkmd_nvgpu_native_view_list_unbind(va->dev->owner, &va->views,
+   return nvkmd_nvgpu_native_view_list_unbind(va->dev->owner, va->views,
                                               va_offset_B, range_B);
 }
 
@@ -547,11 +548,14 @@ native_dev_reserve_va_locked(struct nvkmd_nvgpu_native_dev *dev,
    va->base.addr = addr;
    va->base.size_B = reserved_B;
    va->dev = dev;
-   va->views = (struct nvkmd_nvgpu_native_view_list) {
-      .va_addr = addr,
-      .va_size_B = reserved_B,
-      .pte_kind = pte_kind,
-   };
+   va->views = nvkmd_nvgpu_native_view_list_create(addr, reserved_B,
+                                                   pte_kind);
+   if (!va->views) {
+      nvkmd_nvgpu_native_owner_release_va(dev->owner, addr, reserved_B);
+      free(va);
+      dev->owner->last_va_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    dev->va_count++;
    dev->owner->active_vas++;
    *va_out = &va->base;

@@ -4,7 +4,6 @@
  */
 #include "nvkmd_nvgpu_native_chunked.h"
 #include "nvkmd_nvgpu_native_map.h"
-#include "nvkmd_nvgpu_native_views.h"
 
 #include "util/log.h"
 #include "util/macros.h"
@@ -20,9 +19,20 @@
 #define NATIVE_CHUNK_ALIGN_B (UINT64_C(64) * 1024)
 #define NATIVE_CHUNK_KIND 6
 
+/* The VA of one chunked allocation. It is made with the allocation, so
+ * that a free needs no memory to keep the VA of a chunk that may still be
+ * mapped. The allocation has one reference, and so has each of its chunks
+ * whose own mapping may remain after the free; the VA returns to the heap
+ * with the last. */
+struct nvkmd_nvgpu_native_va_hold {
+   uint64_t addr, size_B;
+   uint32_t references;
+};
+
 struct nvkmd_nvgpu_native_chunked_mem {
    struct nvkmd_mem base;
    struct nvkmd_va va;
+   struct nvkmd_nvgpu_native_va_hold *va_hold;
    struct nvkmd_nvgpu_native_device_owner *owner;
    struct list_head link; /* in owner->chunked_mems */
    uint32_t chunk_count;
@@ -146,42 +156,44 @@ native_chunk_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
    owner->free_chunk_count++;
 }
 
-/* The VA of one chunked allocation while its chunks are unmapped. */
-struct native_chunk_va {
-   uint64_t addr, size_B;
-   /* Made for the first chunk whose own mapping may remain. */
-   struct nvkmd_nvgpu_native_va_hold *hold;
-   /* There was no memory for the hold: the VA stays reserved. */
-   bool lost;
-};
+/* A hold with one reference, the allocation's. NULL when there is no
+ * memory. */
+static struct nvkmd_nvgpu_native_va_hold *
+native_va_hold_create(uint64_t addr, uint64_t size_B)
+{
+   struct nvkmd_nvgpu_native_va_hold *hold = calloc(1, sizeof(*hold));
+   if (!hold)
+      return NULL;
+   hold->addr = addr;
+   hold->size_B = size_B;
+   hold->references = 1;
+   return hold;
+}
 
-/* Strands a chunk whose own mapping at chunk_va may remain. The VA of its
- * allocation is held until device close has unmapped every such chunk. */
+/* Drops one reference; the last returns the VA to the heap. */
+static void
+native_va_hold_drop(struct nvkmd_nvgpu_native_device_owner *owner,
+                    struct nvkmd_nvgpu_native_va_hold *hold)
+{
+   if (--hold->references)
+      return;
+   nvkmd_nvgpu_native_owner_release_va(owner, hold->addr, hold->size_B);
+   free(hold);
+}
+
+/* Strands a chunk whose own mapping at chunk_va may remain. It takes a
+ * reference to the VA of its allocation, until device close has unmapped
+ * it. */
 static void
 native_chunk_strand_mapped(struct nvkmd_nvgpu_native_device_owner *owner,
                            struct nvkmd_nvgpu_native_chunk *chunk,
-                           uint64_t chunk_va, struct native_chunk_va *va,
+                           uint64_t chunk_va,
+                           struct nvkmd_nvgpu_native_va_hold *hold,
                            const char *what, Result rc)
 {
-   if (!va->hold && !va->lost) {
-      va->hold = nvkmd_nvgpu_native_va_hold_create(va->addr, va->size_B);
-      va->lost = !va->hold;
-   }
-   if (va->hold)
-      va->hold->references++;
-   chunk->va_hold = va->hold;
+   hold->references++;
+   chunk->va_hold = hold;
    native_chunk_strand(owner, chunk, chunk_va, what, rc);
-}
-
-/* Returns the VA to the heap, unless a chunk may still be mapped in it. */
-static void
-native_chunk_va_finish(struct nvkmd_nvgpu_native_device_owner *owner,
-                       struct native_chunk_va *va)
-{
-   if (va->hold)
-      nvkmd_nvgpu_native_va_hold_drop(owner, va->hold);
-   else if (!va->lost)
-      nvkmd_nvgpu_native_owner_release_va(owner, va->addr, va->size_B);
 }
 
 /* Unmaps the chunk mapped at chunk_va and returns it to the pool. A chunk
@@ -194,15 +206,16 @@ native_chunk_va_finish(struct nvkmd_nvgpu_native_device_owner *owner,
 static void
 native_chunk_unmap_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
                              struct nvkmd_nvgpu_native_chunk *chunk,
-                             uint64_t chunk_va, struct native_chunk_va *va)
+                             uint64_t chunk_va,
+                             struct nvkmd_nvgpu_native_va_hold *hold)
 {
    Result rc = 0;
    if (nvkmd_nvgpu_native_unmap_range(owner->runtime, &chunk->backing,
                                       chunk_va, NVKMD_NVGPU_NATIVE_CHUNK_B,
                                       &owner->slot, &rc) !=
        NVKMD_NVGPU_NATIVE_MAP_OK)
-      native_chunk_strand_mapped(owner, chunk, chunk_va, va, "unmap failed",
-                                 rc);
+      native_chunk_strand_mapped(owner, chunk, chunk_va, hold,
+                                 "unmap failed", rc);
    else if (chunk->backing.maps)
       native_chunk_set_aside(owner, chunk, 0);
    else
@@ -210,18 +223,19 @@ native_chunk_unmap_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
 }
 
 /* Unmaps the first chunk_count chunks of the memory and returns them to
- * the pool, and the VA to the heap. */
+ * the pool, and drops the allocation's reference to its VA: the VA returns
+ * to the heap unless a chunk may still be mapped in it. */
 static void
 native_chunks_unmap_release_va(struct nvkmd_nvgpu_native_device_owner *owner,
                                struct nvkmd_nvgpu_native_chunk **chunks,
                                uint32_t chunk_count,
-                               struct native_chunk_va *va)
+                               struct nvkmd_nvgpu_native_va_hold *hold)
 {
    for (uint32_t i = 0; i < chunk_count; i++)
       native_chunk_unmap_give_back(
          owner, chunks[i],
-         va->addr + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B, va);
-   native_chunk_va_finish(owner, va);
+         hold->addr + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B, hold);
+   native_va_hold_drop(owner, hold);
 }
 
 /* Unmaps every chunk, returns them to the pool and the VA to the heap.
@@ -229,12 +243,9 @@ native_chunks_unmap_release_va(struct nvkmd_nvgpu_native_device_owner *owner,
 static void
 native_chunked_mem_retire(struct nvkmd_nvgpu_native_chunked_mem *mem)
 {
-   struct native_chunk_va va = {
-      .addr = mem->va.addr,
-      .size_B = mem->va.size_B,
-   };
    native_chunks_unmap_release_va(mem->owner, mem->chunks, mem->chunk_count,
-                                  &va);
+                                  mem->va_hold);
+   mem->va_hold = NULL;
    list_del(&mem->link);
 }
 
@@ -331,8 +342,13 @@ nvkmd_nvgpu_native_chunked_mem_create(
    const uint64_t va = nvkmd_nvgpu_native_owner_reserve_va(
       owner, length_B, MAX2(align_B, NATIVE_CHUNK_ALIGN_B));
    VkResult result = va ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct nvkmd_nvgpu_native_va_hold *hold =
+      va ? native_va_hold_create(va, length_B) : NULL;
+   if (va && !hold) {
+      nvkmd_nvgpu_native_owner_release_va(owner, va, length_B);
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    uint32_t mapped = 0;
-   struct native_chunk_va chunks_va = {.addr = va, .size_B = length_B};
    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) {
       struct nvkmd_nvgpu_native_chunk *chunk = native_chunk_take(owner);
       if (!chunk) {
@@ -353,10 +369,10 @@ nvkmd_nvgpu_native_chunked_mem_create(
             va + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B;
          if (status == NVKMD_NVGPU_NATIVE_MAP_KIND) {
             /* Mapped with another kind. */
-            native_chunk_unmap_give_back(owner, chunk, chunk_va, &chunks_va);
+            native_chunk_unmap_give_back(owner, chunk, chunk_va, hold);
          } else if (status == NVKMD_NVGPU_NATIVE_MAP_WAIT) {
             /* Accepted, and the wait failed: it may be mapped. */
-            native_chunk_strand_mapped(owner, chunk, chunk_va, &chunks_va,
+            native_chunk_strand_mapped(owner, chunk, chunk_va, hold,
                                        "map wait failed", rc);
          } else {
             /* Refused: nothing was mapped. */
@@ -369,14 +385,14 @@ nvkmd_nvgpu_native_chunked_mem_create(
       mapped++;
    }
    if (result != VK_SUCCESS) {
-      if (va)
-         native_chunks_unmap_release_va(owner, mem->chunks, mapped,
-                                        &chunks_va);
+      if (hold)
+         native_chunks_unmap_release_va(owner, mem->chunks, mapped, hold);
       nvkmd_nvgpu_native_owner_unlock(owner);
       free(mem);
       return result;
    }
    mem->chunk_count = count;
+   mem->va_hold = hold;
    list_addtail(&mem->link, &owner->chunked_mems);
    owner->stats.chunked_mems++;
    nvkmd_nvgpu_native_owner_unlock(owner);
@@ -468,8 +484,7 @@ native_chunks_release_stranded(struct nvkmd_nvgpu_native_device_owner *owner)
              NVKMD_NVGPU_NATIVE_MAP_OK) {
          chunk->stranded_va = 0;
          /* Its allocation's VA returns to the heap with the last of them. */
-         if (chunk->va_hold)
-            nvkmd_nvgpu_native_va_hold_drop(owner, chunk->va_hold);
+         native_va_hold_drop(owner, chunk->va_hold);
          chunk->va_hold = NULL;
       }
       /* native_chunk_release strands the chunk again when it fails. */

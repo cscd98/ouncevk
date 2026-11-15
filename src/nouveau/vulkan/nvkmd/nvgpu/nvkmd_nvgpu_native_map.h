@@ -18,7 +18,8 @@ enum nvkmd_nvgpu_native_map_status {
    NVKMD_NVGPU_NATIVE_MAP_WAIT,
    NVKMD_NVGPU_NATIVE_MAP_KIND,
    NVKMD_NVGPU_NATIVE_MAP_FAILED, /* an earlier kind change failed */
-   /* An earlier request on the slot is unresolved: nothing was sent. */
+   /* Nothing was sent: an earlier request on the slot is unresolved, or
+    * there is no memory for the slot's record of this one. */
    NVKMD_NVGPU_NATIVE_MAP_SLOT,
 };
 
@@ -64,16 +65,15 @@ struct nvkmd_nvgpu_native_slot_unmapped {
    uint64_t gpu_va, size_B;
 };
 
-#define NVKMD_NVGPU_NATIVE_SLOT_UNMAPPED_MAX 8
-
 struct nvkmd_nvgpu_native_slot {
    uint32_t index;
    Event event;
    bool ready;
    struct nvkmd_nvgpu_native_slot_pending pending;
-   struct nvkmd_nvgpu_native_slot_unmapped
-      unmapped[NVKMD_NVGPU_NATIVE_SLOT_UNMAPPED_MAX];
-   uint32_t unmapped_count;
+   /* Room for one more record is made before each range unmap is sent, so
+    * a late completion always has its record. */
+   struct nvkmd_nvgpu_native_slot_unmapped *unmapped;
+   uint32_t unmapped_count, unmapped_capacity;
 };
 
 /* What became of a request that was sent on the slot. */

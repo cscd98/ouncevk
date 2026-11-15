@@ -350,14 +350,18 @@ native_owner_release_segment(struct nvkmd_nvgpu_native_device_owner *owner,
    segment->failed = true;
    /* Each step is skipped once it is done, so a call after a failed step
     * continues with that step. */
-   if (segment->alias_map.mapped) {
-      if (nvkmd_nvgpu_native_map_unmap(&segment->alias_map, owner->runtime,
-                                       &segment->backing, &owner->slot) !=
+   if (segment->alias_map.mapped &&
+       nvkmd_nvgpu_native_map_unmap(&segment->alias_map, owner->runtime,
+                                    &segment->backing, &owner->slot) !=
           NVKMD_NVGPU_NATIVE_MAP_OK)
-         return false;
-      segment->alias_ready = false;
+      return false;
+   segment->alias_ready = false;
+   /* The alias VA is the segment's from its reservation: also when the
+    * alias map was refused, or when its unmap completed before this call. */
+   if (segment->alias_lease.start) {
       util_vma_heap_free(&owner->va_heap, segment->alias_lease.start,
                          segment->length_B);
+      segment->alias_lease.start = 0;
    }
    if (segment->map.mapped &&
        nvkmd_nvgpu_native_map_unmap(&segment->map, owner->runtime,

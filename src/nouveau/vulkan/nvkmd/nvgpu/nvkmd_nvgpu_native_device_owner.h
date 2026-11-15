@@ -211,9 +211,10 @@ struct nvkmd_nvgpu_native_device_owner {
     * first kind returns to the pool with its last view's unmap; device
     * close tries the others again. */
    struct nvkmd_nvgpu_native_chunk *stranded_chunks;
-   /* Views whose VA object was destroyed while they may still be mapped
-    * (nvkmd_nvgpu_native_views.c). Device close unmaps them. */
-   struct nvkmd_nvgpu_native_retired_view *retired_views;
+   /* The view lists of VA objects that were destroyed while a view may
+    * still be mapped (nvkmd_nvgpu_native_views.c). Device close unmaps
+    * those views. */
+   struct nvkmd_nvgpu_native_view_list *retired_view_lists;
    /* The registered imports of host pointers
     * (nvkmd_nvgpu_native_host_mem.c). Used under the owner lock. */
    struct list_head host_mems;
@@ -513,13 +514,6 @@ VkResult nvkmd_nvgpu_native_owner_map_backing(
    struct nvkmd_nvgpu_native_device_owner *owner,
    const struct nvkmd_nvgpu_native_view_source *source,
    uint64_t size_B, uint64_t view_addr, uint8_t kind, bool *left_mapped_out);
-
-/* Removes a view's mapping. Returns false when it may remain: the caller
- * keeps the view and does not reuse its VA. */
-bool nvkmd_nvgpu_native_owner_unmap_view(
-   struct nvkmd_nvgpu_native_device_owner *owner,
-   struct nvkmd_nvgpu_native_backing *backing,
-   uint64_t view_addr, uint64_t size_B);
 
 /* Opens the copy channel once. Returns true when it is ready.
  * The steps and results stay in owner->copy for diagnostics. A failure

@@ -26,8 +26,7 @@ struct nvkmd_nvgpu_native_chunk {
    /* For a chunk that is out of the pool: the GPU VA where its own
     * mapping may remain, or 0 when that mapping is gone. */
    uint64_t stranded_va;
-   /* With stranded_va: the hold of the VA of the chunk's allocation, or
-    * NULL when there was no memory for one. */
+   /* With stranded_va: the hold of the VA of the chunk's allocation. */
    struct nvkmd_nvgpu_native_va_hold *va_hold;
 };
 

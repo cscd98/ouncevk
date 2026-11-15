@@ -3,31 +3,13 @@
  * own (an image plane, a sparse buffer).
  *
  * A mapping whose unmap failed may still exist. Its record and its VA are
- * kept: in the VA's view list while the VA object lives, and with the owner
- * afterwards, until device close unmaps it.
+ * kept in the VA's view list, which goes to the owner when the VA object
+ * is destroyed, until device close unmaps the mapping.
  */
 #ifndef NVKMD_NVGPU_NATIVE_VIEWS_H
 #define NVKMD_NVGPU_NATIVE_VIEWS_H
 
 #include "nvkmd_nvgpu_native_device_owner.h"
-
-/* A GPU VA range that stays out of the VA heap after its object was
- * destroyed, because mappings in it may remain. Each such mapping has one
- * reference; the range returns to the heap with the last. */
-struct nvkmd_nvgpu_native_va_hold {
-   uint64_t addr, size_B;
-   uint32_t references;
-};
-
-/* A hold with one reference, the caller's. NULL when there is no memory;
- * the caller then leaves the VA reserved. */
-struct nvkmd_nvgpu_native_va_hold *
-nvkmd_nvgpu_native_va_hold_create(uint64_t addr, uint64_t size_B);
-
-/* Drops one reference. Call with the owner lock held. */
-void nvkmd_nvgpu_native_va_hold_drop(
-   struct nvkmd_nvgpu_native_device_owner *owner,
-   struct nvkmd_nvgpu_native_va_hold *hold);
 
 /* One bound range of a reserved VA: memory mapped again at the VA. */
 struct nvkmd_nvgpu_native_view {
@@ -35,14 +17,23 @@ struct nvkmd_nvgpu_native_view {
    struct nvkmd_nvgpu_native_view_source source;
 };
 
-/* The views of one reserved VA. They do not overlap. Every function takes
- * the owner lock itself or is called with it held. */
+/* The views of one reserved VA, and the VA. They do not overlap. Every
+ * function takes the owner lock itself or is called with it held. */
 struct nvkmd_nvgpu_native_view_list {
+   /* In owner->retired_view_lists, after the VA object is destroyed. */
+   struct nvkmd_nvgpu_native_view_list *next;
    uint64_t va_addr, va_size_B;
    uint8_t pte_kind;
    struct nvkmd_nvgpu_native_view *views;
    uint32_t count, capacity;
 };
+
+/* A list for a VA that the caller reserved. NULL when there is no memory.
+ * The list is allocated here, with the VA object, so that the destruction
+ * of the VA object needs no memory to keep a view that may still be
+ * mapped. */
+struct nvkmd_nvgpu_native_view_list *nvkmd_nvgpu_native_view_list_create(
+   uint64_t va_addr, uint64_t va_size_B, uint8_t pte_kind);
 
 /* Makes room for one more view. A mapping must not exist without its view,
  * so this comes before the map request. */
@@ -66,9 +57,10 @@ VkResult nvkmd_nvgpu_native_view_list_unbind(
    struct nvkmd_nvgpu_native_view_list *list,
    uint64_t offset_B, uint64_t size_B);
 
-/* For the destruction of the VA object: unmaps every view and returns the
- * VA to the heap. Views that may still be mapped go to the owner, which
- * keeps the VA until device close has unmapped them. */
+/* For the destruction of the VA object: unmaps every view, returns the VA
+ * to the heap and frees the list. When a view may still be mapped, the
+ * list goes to the owner instead, with those views and the VA, until
+ * device close has unmapped them. */
 void nvkmd_nvgpu_native_view_list_finish(
    struct nvkmd_nvgpu_native_device_owner *owner,
    struct nvkmd_nvgpu_native_view_list *list);
