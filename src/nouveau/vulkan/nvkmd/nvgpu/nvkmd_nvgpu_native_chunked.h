@@ -14,6 +14,8 @@
 #include "nvkmd/nvkmd.h"
 #include "nvkmd_nvgpu_native_device_owner.h"
 
+struct nvkmd_nvgpu_native_va_hold;
+
 #define NVKMD_NVGPU_NATIVE_CHUNK_B (UINT64_C(4) * 1024 * 1024)
 
 /* One registered chunk of the process heap. */
@@ -24,6 +26,9 @@ struct nvkmd_nvgpu_native_chunk {
    /* For a chunk that is out of the pool: the GPU VA where its own
     * mapping may remain, or 0 when that mapping is gone. */
    uint64_t stranded_va;
+   /* With stranded_va: the hold of the VA of the chunk's allocation, or
+    * NULL when there was no memory for one. */
+   struct nvkmd_nvgpu_native_va_hold *va_hold;
 };
 
 /* A part of a memory range that lies in one backing, for a view. */

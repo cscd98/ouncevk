@@ -117,6 +117,7 @@ if nvk_libounce_nx != ''
       'nvkmd/nvgpu/nvkmd_nvgpu_native_mem.c',
       'nvkmd/nvgpu/nvkmd_nvgpu_native_device_owner.c',
       'nvkmd/nvgpu/nvkmd_nvgpu_native_chunked.c',
+      'nvkmd/nvgpu/nvkmd_nvgpu_native_views.c',
       'nvkmd/nvgpu/nvkmd_nvgpu_native_host_mem.c',
       'nvkmd/nvgpu/nvkmd_nvgpu_native_owner_lock.c',
       'nvkmd/nvgpu/nvkmd_nvgpu_native_pdev.c',

@@ -18,6 +18,8 @@ enum nvkmd_nvgpu_native_backing_status {
    NVKMD_NVGPU_BACKING_FINAL_ATTRIBUTES,
    NVKMD_NVGPU_BACKING_UNREGISTER,
    NVKMD_NVGPU_BACKING_WAIT,
+   /* An earlier request on the slot is unresolved: nothing was sent. */
+   NVKMD_NVGPU_BACKING_SLOT,
 };
 
 /* A CPU span registered with the GPU worker as one range. Its bytes and
@@ -43,10 +45,6 @@ struct nvkmd_nvgpu_native_backing {
    bool registered;
    /* the uncached CPU attribute is set over the span (mode 2). */
    bool attribute_set;
-   /* The worker accepted the unregister request and its wait failed with
-    * an error: whether the range is still registered is unknown, and the
-    * request is not sent again. */
-   bool unregister_unknown;
 };
 
 /* True while a release has something to undo: from the first successful

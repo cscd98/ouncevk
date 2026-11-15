@@ -211,6 +211,9 @@ struct nvkmd_nvgpu_native_device_owner {
     * first kind returns to the pool with its last view's unmap; device
     * close tries the others again. */
    struct nvkmd_nvgpu_native_chunk *stranded_chunks;
+   /* Views whose VA object was destroyed while they may still be mapped
+    * (nvkmd_nvgpu_native_views.c). Device close unmaps them. */
+   struct nvkmd_nvgpu_native_retired_view *retired_views;
    /* The registered imports of host pointers
     * (nvkmd_nvgpu_native_host_mem.c). Used under the owner lock. */
    struct list_head host_mems;
@@ -336,6 +339,8 @@ enum nvkmd_nvgpu_native_device_close_status {
    NVKMD_NVGPU_DEVICE_CLOSE_MAP,
    NVKMD_NVGPU_DEVICE_CLOSE_BACKING,
    NVKMD_NVGPU_DEVICE_CLOSE_NOTIFIER,
+   /* A request on the completion slot is unresolved. */
+   NVKMD_NVGPU_DEVICE_CLOSE_SLOT,
 };
 
 /* Retires the device after every Vulkan object that uses it is gone. The

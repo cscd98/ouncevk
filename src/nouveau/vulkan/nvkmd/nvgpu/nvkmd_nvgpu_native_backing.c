@@ -333,19 +333,25 @@ nvkmd_nvgpu_native_backing_release(
       backing->attribute_set = false;
    }
 
+   /* An unmap or this range's own unregister may be pending on the slot;
+    * its completion can end the registration. */
+   if (backing->registered && !nvkmd_nvgpu_native_slot_settle(slot, &rc))
+      return fail(backing, NVKMD_NVGPU_BACKING_SLOT, rc);
    if (backing->registered) {
-      if (backing->unregister_unknown)
-         return NVKMD_NVGPU_BACKING_WAIT;
       rc = gsvGpuUnregisterMemory(&runtime->gpu, backing->range_id,
                                   slot->index);
+      const struct nvkmd_nvgpu_native_slot_pending request = {
+         .request = NVKMD_NVGPU_NATIVE_SLOT_UNREGISTER,
+         .backing = backing,
+      };
+      const enum nvkmd_nvgpu_native_slot_outcome outcome =
+         nvkmd_nvgpu_native_slot_finish(slot, rc, &request, &rc);
       /* Refused: the range is still registered. */
-      if (R_FAILED(rc))
+      if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
          return fail(backing, NVKMD_NVGPU_BACKING_UNREGISTER, rc);
-      rc = nvkmd_nvgpu_native_slot_wait(slot);
-      if (R_FAILED(rc)) {
-         backing->unregister_unknown = true;
+      /* The slot completes the unregister before its next request. */
+      if (outcome == NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED)
          return fail(backing, NVKMD_NVGPU_BACKING_WAIT, rc);
-      }
       backing->registered = false;
    }
 

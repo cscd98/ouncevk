@@ -12,6 +12,7 @@
 #include "nvkmd_nvgpu_native_progress.h"
 #include "nvkmd_nvgpu_native_runtime.h"
 #include "nvkmd_nvgpu_native_syncobj.h"
+#include "nvkmd_nvgpu_native_views.h"
 
 #include "util/log.h"
 #include "util/macros.h"
@@ -42,21 +43,14 @@ struct nvkmd_nvgpu_native_dev {
    uint32_t va_count;
 };
 
-/* One bound range of a reserved VA: memory mapped again at the VA. */
-struct nvkmd_nvgpu_native_va_view {
-   uint64_t offset_B, size_B;
-   struct nvkmd_nvgpu_native_view_source source;
-};
-
 /* A VA from the owner's VA heap with no memory of its own (an image plane
  * or a sparse-binding buffer). Each bind maps a range of a memory object at
  * the VA with the PTE kind. */
 struct nvkmd_nvgpu_native_va {
    struct nvkmd_va base;
    struct nvkmd_nvgpu_native_dev *dev;
-   uint8_t pte_kind;
-   struct nvkmd_nvgpu_native_va_view *views;
-   uint32_t view_count, view_capacity;
+   /* The memory that is bound in the VA. */
+   struct nvkmd_nvgpu_native_view_list views;
 };
 
 enum {
@@ -358,64 +352,14 @@ native_dev_alloc_tiled(struct nvkmd_dev *base,
    return result;
 }
 
-/* Makes room for one more view in the list. A mapping must not exist
- * without its view, so this comes before the map request. */
-static bool
-native_va_reserve_view(struct nvkmd_nvgpu_native_va *va)
-{
-   if (va->view_count < va->view_capacity)
-      return true;
-   const uint32_t capacity = MAX2(4, va->view_capacity * 2);
-   struct nvkmd_nvgpu_native_va_view *views =
-      realloc(va->views, capacity * sizeof(*views));
-   if (!views)
-      return false;
-   va->views = views;
-   va->view_capacity = capacity;
-   return true;
-}
-
-/* Unmaps the views that are inside [offset_B, +size_B) and removes them
- * from the list. A view whose unmap failed stays in the list: its mapping
- * may remain. Returns false when one stays. */
-static bool
-native_va_unmap_views(struct nvkmd_nvgpu_native_va *va,
-                      uint64_t offset_B, uint64_t size_B)
-{
-   bool all_unmapped = true;
-   uint32_t kept = 0;
-   for (uint32_t i = 0; i < va->view_count; i++) {
-      const struct nvkmd_nvgpu_native_va_view view = va->views[i];
-      const bool inside = view.offset_B >= offset_B &&
-                          view.offset_B + view.size_B <= offset_B + size_B;
-      if (inside &&
-          nvkmd_nvgpu_native_owner_unmap_view(va->dev->owner,
-                                              view.source.backing,
-                                              va->base.addr + view.offset_B,
-                                              view.size_B))
-         continue;
-      if (inside)
-         all_unmapped = false;
-      va->views[kept++] = view;
-   }
-   va->view_count = kept;
-   return all_unmapped;
-}
-
 static void
 native_va_free_locked(struct nvkmd_va *base)
 {
    struct nvkmd_nvgpu_native_va *va =
       container_of(base, struct nvkmd_nvgpu_native_va, base);
-   /* A VA with a view that may still be mapped stays reserved. */
-   if (native_va_unmap_views(va, 0, va->base.size_B))
-      nvkmd_nvgpu_native_owner_release_va(va->dev->owner, va->base.addr,
-                                          va->base.size_B);
-   else
-      mesa_loge("native view: a VA of 0x%llx bytes is not reused: %u of its "
-                "views may still be mapped",
-                (unsigned long long)va->base.size_B, va->view_count);
-   free(va->views);
+   /* Unmaps the views and returns the VA to the heap. Views that may still
+    * be mapped go to the owner, with the VA. */
+   nvkmd_nvgpu_native_view_list_finish(va->dev->owner, &va->views);
    assert(va->dev->va_count && va->dev->owner->active_vas);
    va->dev->va_count--;
    va->dev->owner->active_vas--;
@@ -431,24 +375,6 @@ native_va_free(struct nvkmd_va *base)
    native_va_free_locked(base);
    if (locked)
       nvkmd_nvgpu_native_owner_unlock(owner);
-}
-
-/* Maps the view's backing bytes at its place in the VA and adds it to the
- * list. A view that failed but may be mapped all the same is added too, so
- * that it is unmapped with the others and its VA is not reused. */
-static VkResult
-native_va_map_view(struct nvkmd_nvgpu_native_va *va,
-                   const struct nvkmd_nvgpu_native_va_view *view)
-{
-   if (!native_va_reserve_view(va))
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   bool left_mapped = false;
-   const VkResult result = nvkmd_nvgpu_native_owner_map_backing(
-      va->dev->owner, &view->source, view->size_B,
-      va->base.addr + view->offset_B, va->pte_kind, &left_mapped);
-   if (result == VK_SUCCESS || left_mapped)
-      va->views[va->view_count++] = *view;
-   return result;
 }
 
 /* Binds chunked memory: one view for each chunk part of the range. */
@@ -468,20 +394,17 @@ native_va_bind_chunked_locked(struct nvkmd_nvgpu_native_va *va,
       mem, mem_offset_B, range_B, parts, max);
    VkResult result = count ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) {
-      const struct nvkmd_nvgpu_native_va_view view = {
+      const struct nvkmd_nvgpu_native_view view = {
          .offset_B = va_offset_B + parts[i].offset_B,
          .size_B = parts[i].size_B,
          .source = parts[i].source,
       };
-      result = native_va_map_view(va, &view);
+      result = nvkmd_nvgpu_native_view_list_map(va->dev->owner, &va->views,
+                                                &view);
    }
    free(parts);
    return result;
 }
-
-static VkResult native_va_unbind_views_locked(struct nvkmd_nvgpu_native_va *va,
-                                              uint64_t offset_B,
-                                              uint64_t size_B);
 
 /* Binds memory in a reserved VA. Views do not overlap: a range that is
  * already bound must be unbound first. */
@@ -497,12 +420,12 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    /* A bind replaces what is bound in its range (Vulkan sparse binding):
     * unbind the range first. */
-   for (uint32_t i = 0; i < va->view_count; i++) {
-      const struct nvkmd_nvgpu_native_va_view *view = &va->views[i];
+   for (uint32_t i = 0; i < va->views.count; i++) {
+      const struct nvkmd_nvgpu_native_view *view = &va->views.views[i];
       if (va_offset_B < view->offset_B + view->size_B &&
           view->offset_B < va_offset_B + range_B) {
-         const VkResult unbound =
-            native_va_unbind_views_locked(va, va_offset_B, range_B);
+         const VkResult unbound = nvkmd_nvgpu_native_view_list_unbind(
+            va->dev->owner, &va->views, va_offset_B, range_B);
          if (unbound != VK_SUCCESS)
             return unbound;
          break;
@@ -511,105 +434,19 @@ native_va_bind_view_locked(struct nvkmd_nvgpu_native_va *va,
    if (nvkmd_nvgpu_native_mem_is_chunked(mem))
       return native_va_bind_chunked_locked(va, va_offset_B, mem,
                                            mem_offset_B, range_B);
-   if (!native_va_reserve_view(va))
+   if (!nvkmd_nvgpu_native_view_list_reserve(&va->views))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   struct nvkmd_nvgpu_native_va_view view = {
+   struct nvkmd_nvgpu_native_view view = {
       .offset_B = va_offset_B,
       .size_B = range_B,
    };
    bool left_mapped = false;
    const VkResult result = nvkmd_nvgpu_native_mem_map_view(
-      mem, mem_offset_B, range_B, va->base.addr + va_offset_B, va->pte_kind,
+      mem, mem_offset_B, range_B, va->base.addr + va_offset_B,
+      va->views.pte_kind,
       &view.source, &left_mapped);
    if (result == VK_SUCCESS || left_mapped)
-      va->views[va->view_count++] = view;
-   return result;
-}
-
-/* Unbinds [offset_B, +size_B) of a reserved VA. e5 removes whole mappings
- * only, so a view that the range covers in part is removed and
- * its remaining head and tail are mapped again from the same backing
- * (remove, then a distinct e3: no atomic replacement). */
-static VkResult
-native_va_unbind_views_locked(struct nvkmd_nvgpu_native_va *va,
-                              uint64_t offset_B, uint64_t size_B)
-{
-   if (size_B > UINT64_MAX - offset_B)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-   const uint64_t end_B = offset_B + size_B;
-   /* The parts to keep, at most two for each view, and the view that each
-    * comes from. */
-   struct nvkmd_nvgpu_native_va_view *keep =
-      calloc(2 * (size_t)va->view_count + 1, sizeof(*keep));
-   uint32_t *keep_from = calloc(2 * (size_t)va->view_count + 1,
-                                sizeof(*keep_from));
-   bool *removed = calloc((size_t)va->view_count + 1, sizeof(*removed));
-   if (!keep || !keep_from || !removed) {
-      free(keep);
-      free(keep_from);
-      free(removed);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-   uint32_t keep_count = 0;
-   for (uint32_t i = 0; i < va->view_count; i++) {
-      const struct nvkmd_nvgpu_native_va_view *view = &va->views[i];
-      const uint64_t view_end = view->offset_B + view->size_B;
-      if (view_end <= offset_B || view->offset_B >= end_B)
-         continue;
-      if (view->offset_B < offset_B) {
-         keep_from[keep_count] = i;
-         keep[keep_count++] = (struct nvkmd_nvgpu_native_va_view) {
-            .offset_B = view->offset_B,
-            .size_B = offset_B - view->offset_B,
-            .source = view->source,
-         };
-      }
-      if (view_end > end_B) {
-         struct nvkmd_nvgpu_native_view_source tail = view->source;
-         tail.backing_offset_B += end_B - view->offset_B;
-         keep_from[keep_count] = i;
-         keep[keep_count++] = (struct nvkmd_nvgpu_native_va_view) {
-            .offset_B = end_B,
-            .size_B = view_end - end_B,
-            .source = tail,
-         };
-      }
-   }
-   /* Remove every view that the range touches, as whole records. A view
-    * whose unmap failed stays whole: its mapping may remain, so nothing is
-    * mapped in its place. */
-   VkResult result = VK_SUCCESS;
-   uint32_t kept = 0;
-   for (uint32_t i = 0; i < va->view_count; i++) {
-      const struct nvkmd_nvgpu_native_va_view view = va->views[i];
-      const bool touched = view.offset_B + view.size_B > offset_B &&
-                           view.offset_B < end_B;
-      if (touched &&
-          nvkmd_nvgpu_native_owner_unmap_view(va->dev->owner,
-                                              view.source.backing,
-                                              va->base.addr + view.offset_B,
-                                              view.size_B)) {
-         removed[i] = true;
-         continue;
-      }
-      if (touched)
-         result = VK_ERROR_DEVICE_LOST;
-      va->views[kept++] = view;
-   }
-   va->view_count = kept;
-   /* Map the kept parts of the removed views again. */
-   for (uint32_t i = 0; i < keep_count; i++) {
-      if (!removed[keep_from[i]])
-         continue;
-      const VkResult mapped = native_va_map_view(va, &keep[i]);
-      if (mapped != VK_SUCCESS) {
-         result = mapped;
-         break;
-      }
-   }
-   free(keep);
-   free(keep_from);
-   free(removed);
+      va->views.views[va->views.count++] = view;
    return result;
 }
 
@@ -655,7 +492,8 @@ native_va_unbind_locked(struct nvkmd_va *base,
    (void)log_obj;
    struct nvkmd_nvgpu_native_va *va =
       container_of(base, struct nvkmd_nvgpu_native_va, base);
-   return native_va_unbind_views_locked(va, va_offset_B, range_B);
+   return nvkmd_nvgpu_native_view_list_unbind(va->dev->owner, &va->views,
+                                              va_offset_B, range_B);
 }
 
 static VkResult
@@ -709,7 +547,11 @@ native_dev_reserve_va_locked(struct nvkmd_nvgpu_native_dev *dev,
    va->base.addr = addr;
    va->base.size_B = reserved_B;
    va->dev = dev;
-   va->pte_kind = pte_kind;
+   va->views = (struct nvkmd_nvgpu_native_view_list) {
+      .va_addr = addr,
+      .va_size_B = reserved_B,
+      .pte_kind = pte_kind,
+   };
    dev->va_count++;
    dev->owner->active_vas++;
    *va_out = &va->base;
