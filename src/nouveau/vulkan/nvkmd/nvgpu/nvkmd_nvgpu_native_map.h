@@ -85,7 +85,10 @@ enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_unmap(
 /* Maps backing bytes [backing_offset_B, +size_B) at gpu_va with the kind
  * (1-6), worker raw 0xe3, and waits for the slot. All values are 4 KiB
  * aligned. The VA must be free. On NVKMD_NVGPU_NATIVE_MAP_KIND the mapping
- * exists with another kind; unmap it. *result_out is the service Result. */
+ * exists with another kind; unmap it. On NVKMD_NVGPU_NATIVE_MAP_WAIT the
+ * worker accepted the request but the wait failed: the mapping may exist,
+ * so do not use the VA or the backing bytes for anything else.
+ * *result_out is the service Result. */
 enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_range(
    struct nvkmd_nvgpu_native_runtime *runtime,
    struct nvkmd_nvgpu_native_backing *backing,

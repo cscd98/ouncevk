@@ -39,8 +39,9 @@ VkResult nvkmd_nvgpu_native_host_mem_create(
    struct nvkmd_mem **mem_out);
 
 /* At device close: unmaps and releases the imports that the program did
- * not free. Their memory objects stay until freed. Returns false when a
- * release failed. Call with the owner lock held. */
+ * not free, whose memory objects stay until freed, and the imports that
+ * the program freed but that could not be retired then. Returns false when
+ * an import still could not be retired. Call with the owner lock held. */
 bool nvkmd_nvgpu_native_owner_release_host_mems(
    struct nvkmd_nvgpu_native_device_owner *owner);
 

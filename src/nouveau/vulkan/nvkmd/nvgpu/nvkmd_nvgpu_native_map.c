@@ -215,13 +215,14 @@ nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
    *result_out = rc;
    if (R_FAILED(rc))
       return NVKMD_NVGPU_NATIVE_MAP_REPLY;
+   /* The worker accepted the request, so the mapping exists or will: it
+    * counts from here, also when the wait fails or the kind is not the
+    * requested one. A backing with a mapping cannot be released. */
+   backing->maps++;
    rc = nvkmd_nvgpu_native_slot_wait(slot);
    *result_out = rc;
    if (R_FAILED(rc))
       return NVKMD_NVGPU_NATIVE_MAP_WAIT;
-   /* The mapping exists from here, also when the kind is not the requested
-    * one. The caller must unmap it. */
-   backing->maps++;
    if (selected_kind != kind)
       return NVKMD_NVGPU_NATIVE_MAP_KIND;
    return NVKMD_NVGPU_NATIVE_MAP_OK;

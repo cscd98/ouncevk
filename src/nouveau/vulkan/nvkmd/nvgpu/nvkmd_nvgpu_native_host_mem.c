@@ -16,10 +16,14 @@
  * nvkmd_nvgpu_native_mem.c). */
 #define HOST_MEM_PTE_KIND 6
 
-/* One registered part of the span. */
+/* One part of the span. */
 struct native_host_part {
    uint64_t offset_B, size_B; /* in the span */
    struct nvkmd_nvgpu_native_backing backing;
+   /* The backing is registered with the GPU service, until its release
+    * succeeds. */
+   bool registered;
+   /* The part is, or may be, mapped in the VA, until its unmap succeeds. */
    bool mapped;
 };
 
@@ -30,6 +34,9 @@ struct nvkmd_nvgpu_native_host_mem {
    struct list_head link; /* in owner->host_mems, while registered */
    uint64_t cpu_base;
    bool registered;
+   /* The program freed the memory, or its import failed, while a part
+    * could not be retired. The owner keeps the record and frees it. */
+   bool abandoned;
    uint32_t part_count;
    struct native_host_part parts[];
 };
@@ -89,45 +96,64 @@ native_host_split(uint64_t base, uint64_t size_B,
    return count;
 }
 
-/* Unmaps and releases each registered part. Earlier GPU work is complete
- * and its L2 lines written back first. Call with the owner lock held.
- * Returns false when a part could not be released. */
+/* Unmaps and releases each part, then returns the VA to the heap and takes
+ * the memory off the owner's list. Call with the owner lock held.
+ *
+ * Returns false when a part may still be mapped or registered. The memory
+ * then stays on the owner's list with its VA, so that neither is reused,
+ * and a later call tries again.
+ *
+ * No GPU work is submitted here. Every batch that ran while the memory was
+ * registered ends with the dirty L2 writeback (native_ctx_prepare_batch),
+ * and the program completes its use of the memory before it frees it.
+ */
 static bool
-native_host_mem_retire(struct nvkmd_nvgpu_native_host_mem *mem,
-                       struct nvkmd_dev *dev)
+native_host_mem_retire(struct nvkmd_nvgpu_native_host_mem *mem)
 {
    struct nvkmd_nvgpu_native_device_owner *owner = mem->owner;
    if (!mem->registered)
       return true;
-   mem->registered = false;
-   list_del(&mem->link);
-   if (dev && nvkmd_nvgpu_native_owner_finish_flush(owner, dev) != VK_SUCCESS)
-      mesa_loge("host memory: finish flush failed before release");
-   bool released = true;
+
+   bool retired = true;
    for (uint32_t i = 0; i < mem->part_count; i++) {
       struct native_host_part *part = &mem->parts[i];
-      Result rc = 0;
-      if (part->mapped &&
-          nvkmd_nvgpu_native_unmap_range(owner->runtime, &part->backing,
-                                         mem->va.addr + part->offset_B,
-                                         part->size_B, &owner->slot, &rc) !=
-             NVKMD_NVGPU_NATIVE_MAP_OK)
-         mesa_loge("host memory: unmap failed: 0x%x", rc);
-      part->mapped = false;
-      if (part->backing.ready &&
+      if (part->mapped) {
+         Result rc = 0;
+         if (nvkmd_nvgpu_native_unmap_range(owner->runtime, &part->backing,
+                                            mem->va.addr + part->offset_B,
+                                            part->size_B, &owner->slot,
+                                            &rc) !=
+             NVKMD_NVGPU_NATIVE_MAP_OK) {
+            mesa_loge("host memory: unmap failed: 0x%x", rc);
+            owner->stats.host_import_failures++;
+            retired = false;
+            continue;
+         }
+         part->mapped = false;
+      }
+      if (!part->registered)
+         continue;
+      /* A release that failed earlier left the backing not ready: its
+       * remote state is unknown and it cannot be released again. */
+      if (!part->backing.ready ||
           nvkmd_nvgpu_native_backing_release(&part->backing, owner->runtime,
                                              &owner->slot) !=
              NVKMD_NVGPU_BACKING_OK) {
-         /* The remote state is unknown: the program's memory may stay
-          * registered. */
-         mesa_loge("host memory: release failed: 0x%x",
-                   part->backing.result);
+         mesa_loge("host memory: release failed: 0x%x; the program's "
+                   "memory may stay registered", part->backing.result);
          owner->stats.host_import_failures++;
-         released = false;
+         retired = false;
+         continue;
       }
+      part->registered = false;
    }
+   if (!retired)
+      return false;
+
    nvkmd_nvgpu_native_owner_release_va(owner, mem->va.addr, mem->va.size_B);
-   return released;
+   mem->registered = false;
+   list_del(&mem->link);
+   return true;
 }
 
 static void
@@ -137,11 +163,14 @@ native_host_mem_free(struct nvkmd_mem *base)
       container_of(base, struct nvkmd_nvgpu_native_host_mem, base);
    struct nvkmd_nvgpu_native_device_owner *owner = mem->owner;
    if (nvkmd_nvgpu_native_owner_lock(owner)) {
-      (void)native_host_mem_retire(mem, base->dev);
+      if (!native_host_mem_retire(mem))
+         mem->abandoned = true;
       nvkmd_nvgpu_native_owner_unlock(owner);
    }
    simple_mtx_destroy(&base->map_mutex);
-   free(mem);
+   /* An abandoned record stays on the owner's list. */
+   if (!mem->abandoned)
+      free(mem);
 }
 
 static VkResult
@@ -219,15 +248,18 @@ native_host_mem_register(struct nvkmd_nvgpu_native_host_mem *mem)
                    (unsigned)status, part->backing.result);
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
+      part->registered = true;
       Result rc = 0;
       const enum nvkmd_nvgpu_native_map_status mapped =
          nvkmd_nvgpu_native_map_range(owner->runtime, &part->backing,
                                       mem->va.addr + part->offset_B, 0,
                                       part->size_B, HOST_MEM_PTE_KIND, true,
                                       &owner->slot, &rc);
-      /* With MAP_KIND the mapping exists, with another kind: unmap it. */
+      /* With MAP_KIND the mapping exists, with another kind. With MAP_WAIT
+       * it may exist. Both are unmapped when the memory is retired. */
       part->mapped = mapped == NVKMD_NVGPU_NATIVE_MAP_OK ||
-                     mapped == NVKMD_NVGPU_NATIVE_MAP_KIND;
+                     mapped == NVKMD_NVGPU_NATIVE_MAP_KIND ||
+                     mapped == NVKMD_NVGPU_NATIVE_MAP_WAIT;
       if (mapped != NVKMD_NVGPU_NATIVE_MAP_OK) {
          mesa_loge("host memory: map failed: status %u, result 0x%x",
                    (unsigned)mapped, rc);
@@ -291,10 +323,11 @@ nvkmd_nvgpu_native_host_mem_create(
    const VkResult result = native_host_mem_register(mem);
    if (result != VK_SUCCESS) {
       owner->stats.host_import_failures++;
-      /* No GPU work has used this memory: no flush before the release. */
-      (void)native_host_mem_retire(mem, NULL);
+      if (!native_host_mem_retire(mem))
+         mem->abandoned = true;
       nvkmd_nvgpu_native_owner_unlock(owner);
-      free(mem);
+      if (!mem->abandoned)
+         free(mem);
       return result;
    }
    owner->stats.host_imports++;
@@ -316,8 +349,14 @@ nvkmd_nvgpu_native_owner_release_host_mems(
       return true;
    bool released = true;
    list_for_each_entry_safe(struct nvkmd_nvgpu_native_host_mem, mem,
-                            &owner->host_mems, link)
-      if (!native_host_mem_retire(mem, NULL))
+                            &owner->host_mems, link) {
+      if (!native_host_mem_retire(mem)) {
          released = false;
+         continue;
+      }
+      /* The program no longer has an abandoned record. */
+      if (mem->abandoned)
+         free(mem);
+   }
    return released;
 }
