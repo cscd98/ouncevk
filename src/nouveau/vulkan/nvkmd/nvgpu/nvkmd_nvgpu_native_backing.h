@@ -34,7 +34,30 @@ struct nvkmd_nvgpu_native_backing {
    /* Mode 1: the CPU span keeps its cached attribute (no attribute-8 walk).
     * CPU maps need explicit cache maintenance. */
    bool cpu_cached;
+   /* What a release still has to undo. Each is set when its step of the
+    * registration succeeds, also when a later step fails, and cleared when
+    * its step of the release succeeds:
+    * the SVC 0x80 prepare bit is set over the span; */
+   bool prepared;
+   /* the worker registered the range (range_id); */
+   bool registered;
+   /* the uncached CPU attribute is set over the span (mode 2). */
+   bool attribute_set;
+   /* The worker accepted the unregister request and its wait failed with
+    * an error: whether the range is still registered is unknown, and the
+    * request is not sent again. */
+   bool unregister_unknown;
 };
+
+/* True while a release has something to undo: from the first successful
+ * step of a registration until a release completes. A backing can be held
+ * without being ready, after a registration or a release that failed. */
+static inline bool
+nvkmd_nvgpu_native_backing_held(const struct nvkmd_nvgpu_native_backing *backing)
+{
+   return backing->self == backing &&
+          (backing->prepared || backing->registered || backing->attribute_set);
+}
 
 /* Registers a page-aligned heap span. When cpu_cached is false, this is
  * mode 2. The steps are a QueryMemory check, zeroing, SVC 0x80 (mask and
@@ -67,10 +90,15 @@ enum nvkmd_nvgpu_native_backing_status nvkmd_nvgpu_native_backing_import(
  * read/write, no attributes and no IPC or device references. */
 bool nvkmd_nvgpu_native_backing_importable(const MemoryInfo *info);
 
-/* Releases a backing that has no live maps. For mode 2, it first restores
- * the CPU attribute (SVC 3, mask 8, value 0). It then sends worker raw 0x76
- * on the request slot and waits for its completion. Last, it clears SVC 0x80
- * (mask 0x20, value 0).
+/* Releases a held backing that has no live maps. For mode 2, it first
+ * restores the CPU attribute (SVC 3, mask 8, value 0). It then sends worker
+ * raw 0x76 on the request slot and waits for its completion. Last, it
+ * clears SVC 0x80 (mask 0x20, value 0).
+ *
+ * The backing is not ready afterwards. A step that fails leaves the steps
+ * before it done, and a later call continues with the failed step: a
+ * refused unregister request is sent again, and after a completed one only
+ * the SVC 0x80 clear is repeated.
  */
 enum nvkmd_nvgpu_native_backing_status nvkmd_nvgpu_native_backing_release(
    struct nvkmd_nvgpu_native_backing *backing,

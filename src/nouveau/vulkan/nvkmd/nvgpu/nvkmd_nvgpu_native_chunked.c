@@ -45,8 +45,35 @@ native_chunks_init(struct nvkmd_nvgpu_native_device_owner *owner)
    }
 }
 
+/* Puts a chunk on the owner's list of chunks that are out of the pool. It
+ * stays registered, with its memory. chunk_va is where its own mapping may
+ * remain, or 0. */
+static void
+native_chunk_set_aside(struct nvkmd_nvgpu_native_device_owner *owner,
+                       struct nvkmd_nvgpu_native_chunk *chunk,
+                       uint64_t chunk_va)
+{
+   chunk->stranded_va = chunk_va;
+   chunk->next = owner->stranded_chunks;
+   owner->stranded_chunks = chunk;
+}
+
+/* Sets a chunk aside after a failure: a mapping of it may remain, or its
+ * registration or release failed. It is not reused, and device close tries
+ * it again. */
+static void
+native_chunk_strand(struct nvkmd_nvgpu_native_device_owner *owner,
+                    struct nvkmd_nvgpu_native_chunk *chunk, uint64_t chunk_va,
+                    const char *what, Result rc)
+{
+   owner->stats.chunk_failures++;
+   mesa_loge("native chunk: %s: 0x%x; the chunk is not reused", what, rc);
+   native_chunk_set_aside(owner, chunk, chunk_va);
+}
+
 /* A chunk from the pool, or a new registered chunk. Call with the owner
  * lock held. */
+
 static struct nvkmd_nvgpu_native_chunk *
 native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner)
 {
@@ -71,10 +98,18 @@ native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner)
    if (nvkmd_nvgpu_native_backing_prepare(&chunk->backing, owner->runtime,
                                           cpu, NVKMD_NVGPU_NATIVE_CHUNK_B,
                                           false) != NVKMD_NVGPU_BACKING_OK) {
-      /* The remote state is unknown: keep the memory, do not reuse it. */
-      mesa_loge("native chunk: registration failed: 0x%x",
-                chunk->backing.result);
-      owner->stats.chunk_failures++;
+      if (nvkmd_nvgpu_native_backing_held(&chunk->backing)) {
+         /* Part of the registration remains (a prepared span, a registered
+          * range): the chunk keeps it, and device close releases it. */
+         native_chunk_strand(owner, chunk, 0, "registration failed",
+                             chunk->backing.result);
+      } else {
+         mesa_loge("native chunk: registration failed: 0x%x",
+                   chunk->backing.result);
+         owner->stats.chunk_failures++;
+         free(chunk->allocation);
+         free(chunk);
+      }
       return NULL;
    }
    owner->stats.chunks_registered++;
@@ -82,7 +117,8 @@ native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner)
 }
 
 /* Unregisters a chunk and frees its memory. The caller has completed and
- * flushed every GPU use of it. */
+ * flushed every GPU use of it. Returns false, with the chunk stranded,
+ * when the release failed. */
 static bool
 native_chunk_release(struct nvkmd_nvgpu_native_device_owner *owner,
                      struct nvkmd_nvgpu_native_chunk *chunk)
@@ -90,7 +126,8 @@ native_chunk_release(struct nvkmd_nvgpu_native_device_owner *owner,
    if (nvkmd_nvgpu_native_backing_release(&chunk->backing, owner->runtime,
                                           &owner->slot) !=
        NVKMD_NVGPU_BACKING_OK) {
-      owner->stats.chunk_failures++;
+      native_chunk_strand(owner, chunk, 0, "release failed",
+                          chunk->backing.result);
       return false;
    }
    free(chunk->allocation);
@@ -108,20 +145,13 @@ native_chunk_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
    owner->free_chunk_count++;
 }
 
-/* A chunk whose mapping may remain is not reused: it stays registered and
- * out of the pool, and its memory is not freed. */
-static void
-native_chunk_strand(struct nvkmd_nvgpu_native_device_owner *owner,
-                    const char *what, Result rc)
-{
-   owner->stats.chunk_failures++;
-   mesa_loge("native chunk: %s failed: 0x%x; the chunk is not reused", what,
-             rc);
-}
-
 /* Unmaps the chunk mapped at chunk_va and returns it to the pool. Returns
- * false when the mapping may remain: then the chunk is stranded and the
- * caller must not reuse the VA. */
+ * false when that mapping may remain: the caller must not reuse the VA.
+ *
+ * A chunk that a view still maps is set aside, though its VA is free: a
+ * program may free memory before the sparse resource that is bound to it.
+ * The chunk returns to the pool when its last view is unmapped
+ * (nvkmd_nvgpu_native_owner_reclaim_chunks). */
 static bool
 native_chunk_unmap_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
                              struct nvkmd_nvgpu_native_chunk *chunk,
@@ -132,10 +162,13 @@ native_chunk_unmap_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
                                       chunk_va, NVKMD_NVGPU_NATIVE_CHUNK_B,
                                       &owner->slot, &rc) !=
        NVKMD_NVGPU_NATIVE_MAP_OK) {
-      native_chunk_strand(owner, "unmap", rc);
+      native_chunk_strand(owner, chunk, chunk_va, "unmap failed", rc);
       return false;
    }
-   native_chunk_give_back(owner, chunk);
+   if (chunk->backing.maps)
+      native_chunk_set_aside(owner, chunk, 0);
+   else
+      native_chunk_give_back(owner, chunk);
    return true;
 }
 
@@ -185,7 +218,7 @@ native_chunk_pool_trim(struct nvkmd_nvgpu_native_device_owner *owner,
       owner->free_chunks = chunk->next;
       owner->free_chunk_count--;
       if (!native_chunk_release(owner, chunk))
-         break; /* keep the rest; the failed chunk is not reused */
+         break; /* keep the rest in the pool */
    }
 }
 
@@ -287,7 +320,8 @@ nvkmd_nvgpu_native_chunked_mem_create(
                va_reusable = false;
          } else if (status == NVKMD_NVGPU_NATIVE_MAP_WAIT) {
             /* Accepted, and the wait failed: it may be mapped. */
-            native_chunk_strand(owner, "map wait", rc);
+            native_chunk_strand(owner, chunk, chunk_va, "map wait failed",
+                                rc);
             va_reusable = false;
          } else {
             /* Refused: nothing was mapped. */
@@ -358,6 +392,59 @@ nvkmd_nvgpu_native_chunked_mem_parts(
    return count;
 }
 
+void
+nvkmd_nvgpu_native_owner_reclaim_chunks(
+   struct nvkmd_nvgpu_native_device_owner *owner)
+{
+   struct nvkmd_nvgpu_native_chunk *chunk = owner->stranded_chunks;
+   owner->stranded_chunks = NULL;
+   while (chunk) {
+      struct nvkmd_nvgpu_native_chunk *next = chunk->next;
+      /* A chunk that failed keeps its place: its own mapping may remain,
+       * or its backing is no longer ready. */
+      if (!chunk->stranded_va && !chunk->backing.maps &&
+          chunk->backing.ready) {
+         native_chunk_give_back(owner, chunk);
+      } else {
+         chunk->next = owner->stranded_chunks;
+         owner->stranded_chunks = chunk;
+      }
+      chunk = next;
+   }
+}
+
+/* Tries the set-aside chunks again: unmaps one whose own mapping may
+ * remain, and releases one that nothing maps. Returns false when a chunk
+ * stays on the list. */
+static bool
+native_chunks_release_stranded(struct nvkmd_nvgpu_native_device_owner *owner)
+{
+   struct nvkmd_nvgpu_native_chunk *chunk = owner->stranded_chunks;
+   owner->stranded_chunks = NULL;
+   bool all_released = true;
+   while (chunk) {
+      struct nvkmd_nvgpu_native_chunk *next = chunk->next;
+      Result rc = 0;
+      if (chunk->stranded_va &&
+          nvkmd_nvgpu_native_unmap_range(owner->runtime, &chunk->backing,
+                                         chunk->stranded_va,
+                                         NVKMD_NVGPU_NATIVE_CHUNK_B,
+                                         &owner->slot, &rc) ==
+             NVKMD_NVGPU_NATIVE_MAP_OK)
+         chunk->stranded_va = 0;
+      /* native_chunk_release strands the chunk again when it fails. */
+      if (chunk->stranded_va || chunk->backing.maps) {
+         chunk->next = owner->stranded_chunks;
+         owner->stranded_chunks = chunk;
+         all_released = false;
+      } else if (!native_chunk_release(owner, chunk)) {
+         all_released = false;
+      }
+      chunk = next;
+   }
+   return all_released;
+}
+
 bool
 nvkmd_nvgpu_native_owner_release_chunks(
    struct nvkmd_nvgpu_native_device_owner *owner)
@@ -367,13 +454,14 @@ nvkmd_nvgpu_native_owner_release_chunks(
    list_for_each_entry_safe(struct nvkmd_nvgpu_native_chunked_mem, mem,
                             &owner->chunked_mems, link)
       native_chunked_mem_retire(mem);
-   bool ok = true;
    while (owner->free_chunks) {
       struct nvkmd_nvgpu_native_chunk *chunk = owner->free_chunks;
       owner->free_chunks = chunk->next;
       owner->free_chunk_count--;
-      if (!native_chunk_release(owner, chunk))
-         ok = false;
+      /* A failed release strands the chunk. */
+      native_chunk_release(owner, chunk);
    }
-   return ok;
+   /* Try every stranded chunk once more, those of the pool included. The
+    * result is whether any chunk remains. */
+   return native_chunks_release_stranded(owner);
 }

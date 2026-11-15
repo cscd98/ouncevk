@@ -206,6 +206,11 @@ struct nvkmd_nvgpu_native_device_owner {
    uint32_t free_chunk_count;
    struct list_head chunked_mems;
    bool chunked_ready;
+   /* Chunks that are out of the pool: a view still maps the chunk, or a
+    * mapping of it may remain, or its registration or release failed. The
+    * first kind returns to the pool with its last view's unmap; device
+    * close tries the others again. */
+   struct nvkmd_nvgpu_native_chunk *stranded_chunks;
    /* The registered imports of host pointers
     * (nvkmd_nvgpu_native_host_mem.c). Used under the owner lock. */
    struct list_head host_mems;
@@ -484,21 +489,29 @@ struct nvkmd_nvgpu_native_view_source {
    bool gpu_cacheable;
 };
 
+/* On a failure, *left_mapped_out says whether the mapping exists or may
+ * exist all the same (the worker accepted the request, and its wait failed
+ * or the mapping got another kind and could not be removed). The caller
+ * then keeps the view, with *source_out, and unmaps it later. */
 VkResult nvkmd_nvgpu_native_owner_map_view(
    struct nvkmd_nvgpu_native_device_owner *owner,
    const struct nvkmd_nvgpu_native_arena *arena,
    uint64_t gpu_addr, uint64_t size_B,
    uint64_t view_addr, uint8_t kind,
-   struct nvkmd_nvgpu_native_view_source *source_out);
+   struct nvkmd_nvgpu_native_view_source *source_out,
+   bool *left_mapped_out);
 
 /* Maps backing bytes again at view_addr (a part of an earlier view, after
- * a partial unbind). */
+ * a partial unbind). *left_mapped_out is as for
+ * nvkmd_nvgpu_native_owner_map_view. */
 VkResult nvkmd_nvgpu_native_owner_map_backing(
    struct nvkmd_nvgpu_native_device_owner *owner,
    const struct nvkmd_nvgpu_native_view_source *source,
-   uint64_t size_B, uint64_t view_addr, uint8_t kind);
+   uint64_t size_B, uint64_t view_addr, uint8_t kind, bool *left_mapped_out);
 
-void nvkmd_nvgpu_native_owner_unmap_view(
+/* Removes a view's mapping. Returns false when it may remain: the caller
+ * keeps the view and does not reuse its VA. */
+bool nvkmd_nvgpu_native_owner_unmap_view(
    struct nvkmd_nvgpu_native_device_owner *owner,
    struct nvkmd_nvgpu_native_backing *backing,
    uint64_t view_addr, uint64_t size_B);

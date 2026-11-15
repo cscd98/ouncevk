@@ -336,8 +336,8 @@ native_owner_finish_flush(struct nvkmd_nvgpu_native_device_owner *owner,
  * followed by a wait. It then releases
  * the backing (see nvkmd_nvgpu_native_backing_release). Last, it returns
  * the VA and memory. The caller has joined every earlier use with
- * native_owner_finish_flush. A failed step marks the segment failed. Its
- * remote state is then unknown, so its entry, VA and memory are kept. */
+ * native_owner_finish_flush. A failed step marks the segment failed and
+ * keeps its entry, VA and memory; device close calls this again. */
 static bool
 native_owner_release_segment(struct nvkmd_nvgpu_native_device_owner *owner,
                              struct nvkmd_nvgpu_native_segment *segment)
@@ -347,7 +347,9 @@ native_owner_release_segment(struct nvkmd_nvgpu_native_device_owner *owner,
    segment->release_pending = false;
    segment->ready = false;
    segment->failed = true;
-   if (segment->alias_ready) {
+   /* Each step is skipped once it is done, so a call after a failed step
+    * continues with that step. */
+   if (segment->alias_map.mapped) {
       if (nvkmd_nvgpu_native_map_unmap(&segment->alias_map, owner->runtime,
                                        &segment->backing, &owner->slot) !=
           NVKMD_NVGPU_NATIVE_MAP_OK)
@@ -356,13 +358,15 @@ native_owner_release_segment(struct nvkmd_nvgpu_native_device_owner *owner,
       util_vma_heap_free(&owner->va_heap, segment->alias_lease.start,
                          segment->length_B);
    }
-   if (nvkmd_nvgpu_native_map_unmap(&segment->map, owner->runtime,
+   if (segment->map.mapped &&
+       nvkmd_nvgpu_native_map_unmap(&segment->map, owner->runtime,
                                     &segment->backing, &owner->slot) !=
-       NVKMD_NVGPU_NATIVE_MAP_OK)
+          NVKMD_NVGPU_NATIVE_MAP_OK)
       return false;
-   if (nvkmd_nvgpu_native_backing_release(&segment->backing, owner->runtime,
+   if (nvkmd_nvgpu_native_backing_held(&segment->backing) &&
+       nvkmd_nvgpu_native_backing_release(&segment->backing, owner->runtime,
                                           &owner->slot) !=
-       NVKMD_NVGPU_BACKING_OK)
+          NVKMD_NVGPU_BACKING_OK)
       return false;
    util_vma_heap_free(&owner->va_heap, segment->lease.start,
                       segment->length_B);
@@ -379,7 +383,7 @@ static bool
 native_segment_empty(const struct nvkmd_nvgpu_native_segment *segment)
 {
    return segment->ready && !segment->arena.live_records &&
-          segment->backing.maps == 1u + (segment->alias_ready ? 1u : 0u);
+          segment->backing.maps == 1u + (segment->alias_map.mapped ? 1u : 0u);
 }
 
 /* Releases every empty segment (no live slice) after one finish flush.
@@ -565,7 +569,7 @@ native_owner_grow_failed(struct nvkmd_nvgpu_native_device_owner *owner,
             empty_B += segment->length_B;
          if (segment->release_pending)
             pending_B += segment->length_B;
-         if (segment->backing.maps > 1u + (segment->alias_ready ? 1u : 0u))
+         if (segment->backing.maps > 1u + (segment->alias_map.mapped ? 1u : 0u))
             with_views++;
       } else if (segment->failed) {
          failed++;
@@ -649,8 +653,9 @@ nvkmd_nvgpu_native_owner_grow(
    if (room != NVKMD_NVGPU_SEGMENT_FAILURE_NONE)
       return native_owner_grow_failed(owner, room, 0, length_B);
 
-   /* From here, the entry, memory and VA stay taken if a step fails. The
-    * remote registration or map state is then unknown. */
+   /* From here, the segment owns the entry, the memory and the VA, also
+    * when a step below fails: device close releases what the failed
+    * segment still has. */
    memset(segment, 0, sizeof(*segment));
    segment->kind = kind;
    segment->failed = true;
@@ -658,6 +663,9 @@ nvkmd_nvgpu_native_owner_grow(
    segment->cpu_allocation = allocation;
    segment->length_B = length_B;
    segment->va_align_B = va_align_B;
+   segment->lease = owner->lease;
+   segment->lease.start = va;
+   segment->lease.length = length_B;
    if (nvkmd_nvgpu_native_backing_prepare(
           &segment->backing, runtime, (uintptr_t)cpu, length_B,
           kind == NVKMD_NVGPU_SEGMENT_READBACK) !=
@@ -665,9 +673,6 @@ nvkmd_nvgpu_native_owner_grow(
       return native_owner_grow_failed(owner,
                                       NVKMD_NVGPU_SEGMENT_FAILURE_BACKING,
                                       segment->backing.result, length_B);
-   segment->lease = owner->lease;
-   segment->lease.start = va;
-   segment->lease.length = length_B;
    if (nvkmd_nvgpu_native_map_once(
           &segment->map, runtime, &segment->lease, &segment->backing,
           /* Readback segments are GPU-cached too. Batches then
@@ -759,20 +764,24 @@ native_device_close(struct nvkmd_nvgpu_native_device_owner *owner,
       return NVKMD_NVGPU_DEVICE_CLOSE_SEGMENT;
    if (!nvkmd_nvgpu_native_owner_release_chunks(owner))
       return NVKMD_NVGPU_DEVICE_CLOSE_SEGMENT;
+   /* Every segment that has its memory, the failed ones included: one
+    * whose creation or release failed earlier continues here with what it
+    * still has (a mapping, a held backing, or only its memory and VA). */
    for (uint32_t i = 0; i < owner->segment_count; i++) {
       struct nvkmd_nvgpu_native_segment *segment = &owner->segments[i];
-      if (segment->ready && !native_owner_release_segment(owner, segment))
+      if (segment->cpu_allocation &&
+          !native_owner_release_segment(owner, segment))
          return NVKMD_NVGPU_DEVICE_CLOSE_SEGMENT;
    }
-   if (owner->map.ready &&
+   if (owner->map.mapped &&
        nvkmd_nvgpu_native_map_unmap(&owner->map, runtime, &owner->backing,
                                     &owner->slot) != NVKMD_NVGPU_NATIVE_MAP_OK)
       return NVKMD_NVGPU_DEVICE_CLOSE_MAP;
-   if (owner->backing.ready &&
+   if (nvkmd_nvgpu_native_backing_held(&owner->backing) &&
        nvkmd_nvgpu_native_backing_release(&owner->backing, runtime,
                                           &owner->slot) != NVKMD_NVGPU_BACKING_OK)
       return NVKMD_NVGPU_DEVICE_CLOSE_BACKING;
-   if (owner->notifier.ready &&
+   if (nvkmd_nvgpu_native_backing_held(&owner->notifier) &&
        nvkmd_nvgpu_native_backing_release(&owner->notifier, runtime,
                                           &owner->slot) != NVKMD_NVGPU_BACKING_OK)
       return NVKMD_NVGPU_DEVICE_CLOSE_NOTIFIER;
@@ -896,16 +905,54 @@ native_owner_arena_backing(struct nvkmd_nvgpu_native_device_owner *owner,
    return false;
 }
 
+/* Maps backing bytes at view_addr for a view. Returns false when the view
+ * cannot be used. *left_mapped_out then says whether its mapping exists or
+ * may exist all the same: the worker accepted the request, and either its
+ * wait failed, or the mapping has another kind and could not be removed.
+ * The caller keeps a view record for such a mapping. */
+static bool
+native_owner_map_view_range(struct nvkmd_nvgpu_native_device_owner *owner,
+                            struct nvkmd_nvgpu_native_backing *backing,
+                            uint64_t backing_offset_B, uint64_t size_B,
+                            uint64_t view_addr, uint8_t kind,
+                            bool gpu_cacheable, bool *left_mapped_out)
+{
+   Result rc = 0;
+   const enum nvkmd_nvgpu_native_map_status status =
+      nvkmd_nvgpu_native_map_range(owner->runtime, backing, view_addr,
+                                   backing_offset_B, size_B, kind,
+                                   gpu_cacheable, &owner->slot, &rc);
+   *left_mapped_out = false;
+   if (status == NVKMD_NVGPU_NATIVE_MAP_OK) {
+      owner->stats.view_maps++;
+      return true;
+   }
+   owner->stats.view_map_failures++;
+   mesa_loge("native view: map of 0x%llx bytes, kind %u, failed: status %u, "
+             "result 0x%x", (unsigned long long)size_B, kind,
+             (unsigned)status, rc);
+   if (status == NVKMD_NVGPU_NATIVE_MAP_KIND)
+      *left_mapped_out =
+         nvkmd_nvgpu_native_unmap_range(owner->runtime, backing, view_addr,
+                                        size_B, &owner->slot, &rc) !=
+         NVKMD_NVGPU_NATIVE_MAP_OK;
+   else if (status == NVKMD_NVGPU_NATIVE_MAP_WAIT)
+      *left_mapped_out = true;
+   return false;
+}
+
 VkResult
 nvkmd_nvgpu_native_owner_map_view(
    struct nvkmd_nvgpu_native_device_owner *owner,
    const struct nvkmd_nvgpu_native_arena *arena,
    uint64_t gpu_addr, uint64_t size_B,
    uint64_t view_addr, uint8_t kind,
-   struct nvkmd_nvgpu_native_view_source *source_out)
+   struct nvkmd_nvgpu_native_view_source *source_out,
+   bool *left_mapped_out)
 {
-   if (!owner || !arena || !source_out || !size_B)
+   if (!owner || !arena || !source_out || !left_mapped_out || !size_B)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   *left_mapped_out = false;
    if (!nvkmd_nvgpu_native_owner_lock(owner))
       return VK_ERROR_DEVICE_LOST;
    struct nvkmd_nvgpu_native_backing *backing = NULL;
@@ -914,51 +961,46 @@ nvkmd_nvgpu_native_owner_map_view(
    if (native_owner_arena_backing(owner, arena, &backing, &map) &&
        gpu_addr >= map->gpu_va && size_B <= map->length &&
        gpu_addr - map->gpu_va <= map->length - size_B) {
-      Result rc = 0;
-      const enum nvkmd_nvgpu_native_map_status status =
-         nvkmd_nvgpu_native_map_range(owner->runtime, backing, view_addr,
-                                      gpu_addr - map->gpu_va, size_B, kind,
-                                      !map->gpu_uncached, &owner->slot, &rc);
-      if (status == NVKMD_NVGPU_NATIVE_MAP_OK) {
-         owner->stats.view_maps++;
-         *source_out = (struct nvkmd_nvgpu_native_view_source) {
-            .backing = backing,
-            .backing_offset_B = gpu_addr - map->gpu_va,
-            .gpu_cacheable = !map->gpu_uncached,
-         };
+      *source_out = (struct nvkmd_nvgpu_native_view_source) {
+         .backing = backing,
+         .backing_offset_B = gpu_addr - map->gpu_va,
+         .gpu_cacheable = !map->gpu_uncached,
+      };
+      if (native_owner_map_view_range(owner, backing,
+                                      source_out->backing_offset_B, size_B,
+                                      view_addr, kind,
+                                      source_out->gpu_cacheable,
+                                      left_mapped_out))
          result = VK_SUCCESS;
-      } else {
-         if (status == NVKMD_NVGPU_NATIVE_MAP_KIND)
-            (void)nvkmd_nvgpu_native_unmap_range(owner->runtime, backing,
-                                                 view_addr, size_B,
-                                                 &owner->slot, &rc);
-         owner->stats.view_map_failures++;
-         mesa_loge("native view: map of 0x%llx bytes, kind %u, failed: "
-                   "status %u, result 0x%x",
-                   (unsigned long long)size_B, kind, (unsigned)status, rc);
-      }
    }
    nvkmd_nvgpu_native_owner_unlock(owner);
    return result;
 }
 
-void
+bool
 nvkmd_nvgpu_native_owner_unmap_view(
    struct nvkmd_nvgpu_native_device_owner *owner,
    struct nvkmd_nvgpu_native_backing *backing,
    uint64_t view_addr, uint64_t size_B)
 {
    if (!owner || !backing || !nvkmd_nvgpu_native_owner_lock(owner))
-      return;
+      return false;
    Result rc = 0;
-   if (nvkmd_nvgpu_native_unmap_range(owner->runtime, backing, view_addr,
-                                      size_B, &owner->slot, &rc) !=
-       NVKMD_NVGPU_NATIVE_MAP_OK) {
+   const bool unmapped =
+      nvkmd_nvgpu_native_unmap_range(owner->runtime, backing, view_addr,
+                                     size_B, &owner->slot, &rc) ==
+      NVKMD_NVGPU_NATIVE_MAP_OK;
+   if (!unmapped) {
       owner->stats.view_map_failures++;
       mesa_loge("native view: unmap of 0x%llx bytes failed: result 0x%x",
                 (unsigned long long)size_B, rc);
+   } else if (owner->stranded_chunks) {
+      /* This may have been the last view of a chunk whose memory the
+       * program freed first. */
+      nvkmd_nvgpu_native_owner_reclaim_chunks(owner);
    }
    nvkmd_nvgpu_native_owner_unlock(owner);
+   return unmapped;
 }
 
 /* The engine catalog record of a copy engine with a selector of its own:
@@ -1054,28 +1096,18 @@ VkResult
 nvkmd_nvgpu_native_owner_map_backing(
    struct nvkmd_nvgpu_native_device_owner *owner,
    const struct nvkmd_nvgpu_native_view_source *source,
-   uint64_t size_B, uint64_t view_addr, uint8_t kind)
+   uint64_t size_B, uint64_t view_addr, uint8_t kind, bool *left_mapped_out)
 {
-   if (!owner || !source || !source->backing || !size_B)
+   if (!owner || !source || !source->backing || !left_mapped_out || !size_B)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   *left_mapped_out = false;
    if (!nvkmd_nvgpu_native_owner_lock(owner))
       return VK_ERROR_DEVICE_LOST;
-   Result rc = 0;
-   const enum nvkmd_nvgpu_native_map_status status =
-      nvkmd_nvgpu_native_map_range(owner->runtime, source->backing, view_addr,
-                                   source->backing_offset_B, size_B, kind,
-                                   source->gpu_cacheable, &owner->slot, &rc);
-   if (status == NVKMD_NVGPU_NATIVE_MAP_KIND)
-      (void)nvkmd_nvgpu_native_unmap_range(owner->runtime, source->backing,
-                                           view_addr, size_B, &owner->slot,
-                                           &rc);
-   if (status == NVKMD_NVGPU_NATIVE_MAP_OK)
-      owner->stats.view_maps++;
-   else
-      owner->stats.view_map_failures++;
+   const bool mapped = native_owner_map_view_range(
+      owner, source->backing, source->backing_offset_B, size_B, view_addr,
+      kind, source->gpu_cacheable, left_mapped_out);
    nvkmd_nvgpu_native_owner_unlock(owner);
-   return status == NVKMD_NVGPU_NATIVE_MAP_OK ? VK_SUCCESS
-                                              : VK_ERROR_DEVICE_LOST;
+   return mapped ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
 }
 
 VkResult

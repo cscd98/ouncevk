@@ -220,8 +220,11 @@ VkResult
 nvkmd_nvgpu_native_mem_map_view(const struct nvkmd_mem *base,
                                 uint64_t offset_B, uint64_t size_B,
                                 uint64_t view_addr, uint8_t kind,
-                                struct nvkmd_nvgpu_native_view_source *source_out)
+                                struct nvkmd_nvgpu_native_view_source *source_out,
+                                bool *left_mapped_out)
 {
+   if (left_mapped_out)
+      *left_mapped_out = false;
    if (!base || base->ops != &native_mem_ops)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const struct nvkmd_nvgpu_native_mem *mem =
@@ -232,7 +235,8 @@ nvkmd_nvgpu_native_mem_map_view(const struct nvkmd_mem *base,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    return nvkmd_nvgpu_native_owner_map_view(mem->arena->owner, mem->arena,
                                             mem->slice.gpu + offset_B, size_B,
-                                            view_addr, kind, source_out);
+                                            view_addr, kind, source_out,
+                                            left_mapped_out);
 }
 
 bool

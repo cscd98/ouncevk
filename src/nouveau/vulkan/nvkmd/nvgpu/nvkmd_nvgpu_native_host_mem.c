@@ -19,10 +19,9 @@
 /* One part of the span. */
 struct native_host_part {
    uint64_t offset_B, size_B; /* in the span */
+   /* Held (nvkmd_nvgpu_native_backing_held) from its registration until
+    * its release succeeds. */
    struct nvkmd_nvgpu_native_backing backing;
-   /* The backing is registered with the GPU service, until its release
-    * succeeds. */
-   bool registered;
    /* The part is, or may be, mapped in the VA, until its unmap succeeds. */
    bool mapped;
 };
@@ -131,11 +130,8 @@ native_host_mem_retire(struct nvkmd_nvgpu_native_host_mem *mem)
          }
          part->mapped = false;
       }
-      if (!part->registered)
-         continue;
-      /* A release that failed earlier left the backing not ready: its
-       * remote state is unknown and it cannot be released again. */
-      if (!part->backing.ready ||
+      /* A release that failed earlier continues with its failed step. */
+      if (nvkmd_nvgpu_native_backing_held(&part->backing) &&
           nvkmd_nvgpu_native_backing_release(&part->backing, owner->runtime,
                                              &owner->slot) !=
              NVKMD_NVGPU_BACKING_OK) {
@@ -143,9 +139,7 @@ native_host_mem_retire(struct nvkmd_nvgpu_native_host_mem *mem)
                    "memory may stay registered", part->backing.result);
          owner->stats.host_import_failures++;
          retired = false;
-         continue;
       }
-      part->registered = false;
    }
    if (!retired)
       return false;
@@ -246,9 +240,10 @@ native_host_mem_register(struct nvkmd_nvgpu_native_host_mem *mem)
                    (unsigned long long)part->size_B,
                    (unsigned long long)(mem->cpu_base + part->offset_B),
                    (unsigned)status, part->backing.result);
+         /* The backing can be held all the same (a step after its
+          * registration failed): the caller's retire releases it. */
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
-      part->registered = true;
       Result rc = 0;
       const enum nvkmd_nvgpu_native_map_status mapped =
          nvkmd_nvgpu_native_map_range(owner->runtime, &part->backing,

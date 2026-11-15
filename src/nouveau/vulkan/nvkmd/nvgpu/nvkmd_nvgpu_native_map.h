@@ -36,7 +36,8 @@ struct nvkmd_nvgpu_native_slot {
 Result nvkmd_nvgpu_native_slot_open(struct nvkmd_nvgpu_native_slot *slot,
                                     struct nvkmd_nvgpu_native_runtime *runtime);
 void nvkmd_nvgpu_native_slot_close(struct nvkmd_nvgpu_native_slot *slot);
-/* Waits up to 5 s for the slot to complete the request just sent. */
+/* Waits, without a limit, for the slot to complete the request just sent.
+ * Fails only for a wait error other than a timeout. */
 Result nvkmd_nvgpu_native_slot_wait(struct nvkmd_nvgpu_native_slot *slot);
 
 /* One GPU map of a whole registered range. Keep it at a stable address. */
@@ -47,6 +48,9 @@ struct nvkmd_nvgpu_native_map_owner {
    uint32_t vm_id, range_id;
    Result result;
    bool attempted, ready, gpu_uncached;
+   /* The worker accepted the map request, and no unmap has completed: the
+    * mapping exists or may exist, whether or not the map is ready for use. */
+   bool mapped;
    /* A raw 0xe4 kind change failed or has an unknown result. No more kind
     * changes are attempted. */
    bool modify_failed;
@@ -75,7 +79,9 @@ enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_modify_kind(
    uint64_t offset_B, uint64_t size_B, uint8_t kind,
    struct nvkmd_nvgpu_native_slot *slot);
 
-/* Unmaps a ready map (worker raw 0xe5) and waits for the slot. */
+/* Unmaps a map that is or may be mapped (worker raw 0xe5) and waits for
+ * the slot. The map is not ready afterwards. After a refused request it is
+ * still mapped, and this can be called again. */
 enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_unmap(
    struct nvkmd_nvgpu_native_map_owner *map,
    struct nvkmd_nvgpu_native_runtime *runtime,
@@ -86,9 +92,9 @@ enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_unmap(
  * (1-6), worker raw 0xe3, and waits for the slot. All values are 4 KiB
  * aligned. The VA must be free. On NVKMD_NVGPU_NATIVE_MAP_KIND the mapping
  * exists with another kind; unmap it. On NVKMD_NVGPU_NATIVE_MAP_WAIT the
- * worker accepted the request but the wait failed: the mapping may exist,
- * so do not use the VA or the backing bytes for anything else.
- * *result_out is the service Result. */
+ * worker accepted the request but the wait failed with an error (a timeout
+ * is waited out): the mapping may exist, so do not use the VA or the
+ * backing bytes for anything else. *result_out is the service Result. */
 enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_range(
    struct nvkmd_nvgpu_native_runtime *runtime,
    struct nvkmd_nvgpu_native_backing *backing,

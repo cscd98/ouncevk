@@ -234,6 +234,7 @@ backing_register(struct nvkmd_nvgpu_native_backing *backing,
                             BACKING_PREPARE_BIT, BACKING_PREPARE_BIT);
    if (R_FAILED(rc))
       return fail(backing, NVKMD_NVGPU_BACKING_PREPARE, rc);
+   backing->prepared = true;
    record_span(cpu_base, length);
 
    rc = gsvGpuRegisterMemory(&runtime->gpu, cpu_base, length,
@@ -252,6 +253,9 @@ backing_register(struct nvkmd_nvgpu_native_backing *backing,
       }
       return fail(backing, NVKMD_NVGPU_BACKING_REGISTER, rc);
    }
+   /* The range is registered from here, also when a check below fails: the
+    * caller releases the backing. */
+   backing->registered = true;
 
    if (!query(cpu_base, &info))
       return NVKMD_NVGPU_BACKING_QUERY;
@@ -271,6 +275,7 @@ backing_register(struct nvkmd_nvgpu_native_backing *backing,
       if (R_FAILED(rc))
          return fail(backing, NVKMD_NVGPU_BACKING_SET_ATTRIBUTES, rc);
    }
+   backing->attribute_set = true;
    record_uncached(cpu_base);
    if (!query(cpu_base, &info))
       return NVKMD_NVGPU_BACKING_QUERY;
@@ -310,29 +315,48 @@ nvkmd_nvgpu_native_backing_release(
 {
    if (!backing || !runtime || !slot)
       return NVKMD_NVGPU_BACKING_ARGUMENT;
-   if (backing->self != backing || !backing->ready || backing->maps ||
+   if (!nvkmd_nvgpu_native_backing_held(backing) || backing->maps ||
        backing->generation != runtime->generation || !slot->ready)
       return NVKMD_NVGPU_BACKING_STATE;
 
+   /* No new map from here. Each step clears its flag when it succeeds, so
+    * a call after a failure continues with the step that failed. */
    backing->ready = false;
    void *const cpu = (void *)(uintptr_t)backing->cpu_base;
    Result rc;
-   if (backing->cpu_uncached) {
+
+   if (backing->attribute_set) {
       rc = svcSetMemoryAttribute(cpu, backing->length,
                                  BACKING_UNCACHED_ATTRIBUTE, 0);
       if (R_FAILED(rc))
          return fail(backing, NVKMD_NVGPU_BACKING_SET_ATTRIBUTES, rc);
+      backing->attribute_set = false;
    }
-   rc = gsvGpuUnregisterMemory(&runtime->gpu, backing->range_id, slot->index);
-   if (R_FAILED(rc))
-      return fail(backing, NVKMD_NVGPU_BACKING_UNREGISTER, rc);
-   rc = nvkmd_nvgpu_native_slot_wait(slot);
-   if (R_FAILED(rc))
-      return fail(backing, NVKMD_NVGPU_BACKING_WAIT, rc);
-   rc = svcUnknown80(cpu, backing->length, BACKING_PREPARE_BIT, 0);
-   if (R_FAILED(rc))
-      return fail(backing, NVKMD_NVGPU_BACKING_PREPARE, rc);
-   forget_span(backing->cpu_base);
+
+   if (backing->registered) {
+      if (backing->unregister_unknown)
+         return NVKMD_NVGPU_BACKING_WAIT;
+      rc = gsvGpuUnregisterMemory(&runtime->gpu, backing->range_id,
+                                  slot->index);
+      /* Refused: the range is still registered. */
+      if (R_FAILED(rc))
+         return fail(backing, NVKMD_NVGPU_BACKING_UNREGISTER, rc);
+      rc = nvkmd_nvgpu_native_slot_wait(slot);
+      if (R_FAILED(rc)) {
+         backing->unregister_unknown = true;
+         return fail(backing, NVKMD_NVGPU_BACKING_WAIT, rc);
+      }
+      backing->registered = false;
+   }
+
+   if (backing->prepared) {
+      rc = svcUnknown80(cpu, backing->length, BACKING_PREPARE_BIT, 0);
+      if (R_FAILED(rc))
+         return fail(backing, NVKMD_NVGPU_BACKING_PREPARE, rc);
+      backing->prepared = false;
+      forget_span(backing->cpu_base);
+   }
+
    memset(backing, 0, sizeof(*backing));
    return NVKMD_NVGPU_BACKING_OK;
 }

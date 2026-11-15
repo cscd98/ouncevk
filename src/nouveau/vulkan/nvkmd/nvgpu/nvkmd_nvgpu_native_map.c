@@ -10,7 +10,8 @@
 #define MAP_PAGE_B UINT64_C(0x1000)
 #define MAP_SLOT_LIMIT 32
 #define MAP_KIND_ORDINARY 6
-#define MAP_WAIT_NS UINT64_C(5000000000)
+/* One wait for a slot's completion. A wait that times out is repeated. */
+#define MAP_WAIT_SLICE_NS UINT64_C(1000000000)
 
 Result
 nvkmd_nvgpu_native_slot_open(struct nvkmd_nvgpu_native_slot *slot,
@@ -43,10 +44,21 @@ nvkmd_nvgpu_native_slot_close(struct nvkmd_nvgpu_native_slot *slot)
    memset(slot, 0, sizeof(*slot));
 }
 
+/* Waits for the completion of the request that the worker accepted on the
+ * slot, without a limit: a timeout says nothing about the request, which
+ * the service still runs, and the slot stays busy until it completes. A
+ * caller that gave up could neither send another request on the slot nor
+ * tell what the first one did. Returns a failure only for a wait error
+ * other than a timeout.
+ */
 Result
 nvkmd_nvgpu_native_slot_wait(struct nvkmd_nvgpu_native_slot *slot)
 {
-   return eventWait(&slot->event, MAP_WAIT_NS);
+   for (;;) {
+      const Result rc = eventWait(&slot->event, MAP_WAIT_SLICE_NS);
+      if (R_VALUE(rc) != KERNELRESULT(TimedOut))
+         return rc;
+   }
 }
 
 static enum nvkmd_nvgpu_native_map_status
@@ -101,6 +113,10 @@ nvkmd_nvgpu_native_map_once(struct nvkmd_nvgpu_native_map_owner *map,
    Result rc = gsvGpuMap(&runtime->gpu, &mapping, slot->index, &selected_kind);
    if (R_FAILED(rc))
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_REPLY, rc);
+   /* The worker accepted the request, so the mapping exists or will: it
+    * counts from here, also when the wait fails or the kind is another. */
+   map->mapped = true;
+   backing->maps++;
    rc = nvkmd_nvgpu_native_slot_wait(slot);
    if (R_FAILED(rc))
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_WAIT, rc);
@@ -109,7 +125,6 @@ nvkmd_nvgpu_native_map_once(struct nvkmd_nvgpu_native_map_owner *map,
 
    map->gpu_uncached = !gpu_cacheable;
    map->ready = true;
-   backing->maps++;
    return NVKMD_NVGPU_NATIVE_MAP_OK;
 }
 
@@ -159,11 +174,13 @@ nvkmd_nvgpu_native_map_unmap(struct nvkmd_nvgpu_native_map_owner *map,
 {
    if (!map || map->self != map || !runtime || !backing || !slot)
       return NVKMD_NVGPU_NATIVE_MAP_ARGUMENT;
-   if (!map->ready || !slot->ready || !backing->maps ||
+   if (!map->mapped || !slot->ready || !backing->maps ||
        map->range_id != backing->range_id ||
        map->generation != runtime->generation)
       return NVKMD_NVGPU_NATIVE_MAP_STATE;
 
+   /* No more use of the map. It stays mapped until the unmap completes: a
+    * refused unmap can be sent again. */
    map->ready = false;
    Result rc = gsvGpuUnmap(&runtime->gpu, map->vm_id, map->gpu_va,
                            map->length, slot->index);
@@ -172,6 +189,7 @@ nvkmd_nvgpu_native_map_unmap(struct nvkmd_nvgpu_native_map_owner *map,
    rc = nvkmd_nvgpu_native_slot_wait(slot);
    if (R_FAILED(rc))
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_WAIT, rc);
+   map->mapped = false;
    backing->maps--;
    return NVKMD_NVGPU_NATIVE_MAP_OK;
 }

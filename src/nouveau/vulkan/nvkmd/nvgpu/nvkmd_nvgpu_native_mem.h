@@ -35,7 +35,7 @@ struct nvkmd_nvgpu_native_view_source;
 VkResult nvkmd_nvgpu_native_mem_map_view(
    const struct nvkmd_mem *base, uint64_t offset_B, uint64_t size_B,
    uint64_t view_addr, uint8_t kind,
-   struct nvkmd_nvgpu_native_view_source *source_out);
+   struct nvkmd_nvgpu_native_view_source *source_out, bool *left_mapped_out);
 
 bool nvkmd_nvgpu_native_mem_matches_slice(
    const struct nvkmd_mem *base,
