@@ -75,6 +75,10 @@ get_conservative_raster_reg(const struct nv_device_info *devinfo)
    return 0x418800;
 }
 
+/* How many times SET_PRIV_REG reads the falcon's acknowledgement before it
+ * goes on without it. Each poll also sends a NO_OPERATION. */
+#define NVK_PRIV_REG_ACK_POLLS 4096
+
 static void
 mme_set_priv_reg(struct mme_builder *b,
                  struct mme_value value,
@@ -92,12 +96,24 @@ mme_set_priv_reg(struct mme_builder *b,
    mme_mthd(b, NV9097_SET_FALCON04);
    mme_emit(b, reg);
 
-   struct mme_value loop_cond = mme_mov(b, mme_zero());
-   mme_while(b, ine, loop_cond, mme_imm(1)) {
-      mme_state_to(b, loop_cond, NVK_SET_MME_SCRATCH(FALCON_0));
+   /* The falcon writes 1 to the scratch word when it has made the write.
+    * Wait for it, but not forever: a write the falcon does not acknowledge
+    * must not hang the channel. Whether the Switch 2 falcon acknowledges is
+    * not known; the write takes effect either way.
+    */
+   struct mme_value acknowledged = mme_mov(b, mme_zero());
+   struct mme_value polls_left = mme_mov(b, mme_imm(NVK_PRIV_REG_ACK_POLLS));
+   mme_while(b, ine, acknowledged, mme_imm(1)) {
+      mme_state_to(b, acknowledged, NVK_SET_MME_SCRATCH(FALCON_0));
+      mme_sub_to(b, polls_left, polls_left, mme_imm(1));
+      mme_if(b, ieq, polls_left, mme_zero()) {
+         mme_mov_to(b, acknowledged, mme_imm(1));
+      }
       mme_mthd(b, NV9097_NO_OPERATION);
       mme_emit(b, mme_zero());
    };
+   mme_free_reg(b, polls_left);
+   mme_free_reg(b, acknowledged);
 }
 
 void
@@ -191,12 +207,19 @@ nvk_push_draw_state_init(struct nvk_queue *queue, struct nv_push *p)
     * occasionally fail.
     */
 
-   /* SET_FALCON04 sends these writes through the FECS falcon. An
-    * unprivileged SoC channel cannot drive that falcon.
+   /* SET_FALCON04 sends these writes through the FECS falcon. Upstream NVK
+    * does not send them from a SoC channel.
+    *
+    * The Switch 2 GPU (a SoC) needs this one. Without it, helper
+    * invocations do not load from memory and keep the destination's old
+    * value: a loop bounded by a loaded value ran up to 65535 times in
+    * helper lanes while the rest of the warp waited, and derivatives of
+    * loaded values were wrong at primitive edges. The console's own
+    * graphics driver makes the same masked write.
     */
    const bool priv_reg_ok = pdev->info.type != NV_DEVICE_TYPE_SOC;
 
-   if (pdev->info.cls_eng3d >= MAXWELL_B && priv_reg_ok) {
+   if (pdev->info.cls_eng3d >= MAXWELL_B) {
       unsigned reg = get_sm_disp_ctrl_reg(&pdev->info);
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_PRIV_REG));
       P_INLINE_DATA(p, 0);
