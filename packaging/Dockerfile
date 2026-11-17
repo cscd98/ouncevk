@@ -15,6 +15,9 @@ ARG LIBOUNCE_VERSION=20261117
 # The commit time, so that the package's file times do not depend on the
 # build.
 ARG SOURCE_DATE_EPOCH=0
+# The commit, for Mesa's version string ("Mesa 26.2.2 (git-...)"): the build
+# has the commit's files but no .git.
+ARG GIT_SHA1=
 
 # makepkg packages with fakeroot and zstd.
 RUN apt-get update && \
@@ -46,6 +49,7 @@ USER builder
 WORKDIR /work/packaging
 RUN test -n "$VERSION" && \
     OUNCEVK_VERSION="$VERSION" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    MESA_GIT_SHA1_OVERRIDE="$GIT_SHA1" \
     BUILDDIR=/tmp/makepkg PKGDEST=/home/builder/out PACKAGER=ouncebrew \
     dkp-makepkg --nodeps --noconfirm
 

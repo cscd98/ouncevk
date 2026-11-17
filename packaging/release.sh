@@ -39,6 +39,7 @@ mkdir -p "$out"
 "$container" build -t ouncevk-toolchain "$context/switch2/toolchain"
 "$container" build -f "$context/packaging/Dockerfile" \
     --build-arg TOOLCHAIN_IMAGE=ouncevk-toolchain \
+    --build-arg GIT_SHA1="$commit" \
     --build-arg VERSION="$version" \
     --build-arg SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$commit")" \
     --output "type=local,dest=$out" "$context"
