@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT
+#
+# OunceVK's pacman package, for devkitPro's pacman (dkp-pacman). Dockerfile
+# builds it with dkp-makepkg in OunceVK's toolchain image, with the repository
+# at /work and libounce at /ounce-nx, where OunceVK's build scripts take them:
+#   OUNCEVK_VERSION=20261117 dkp-makepkg
+# It installs the portlib that switch2/build/package-portlib.sh makes into
+# $DEVKITPRO/portlibs/switch2.
+
+pkgname=ouncevk
+pkgver=${OUNCEVK_VERSION:?set OUNCEVK_VERSION to the release version}
+pkgrel=1
+pkgdesc='Vulkan, OpenGL and OpenGL ES for Switch 2 (NVK and Zink)'
+arch=('any')
+url='https://github.com/ouncebrew/ouncevk'
+license=('MIT')
+groups=('ounce-devkit')
+depends=('libounce')
+makedepends=('devkitA64')
+# Static AArch64 archives: the host's strip must not touch them.
+options=(!strip staticlibs)
+
+# The archives of the lists in package-portlib.sh, which it packages.
+#   archives LIST...
+archives() {
+    for list in "$@"; do
+        sed -n "/^$list=\"/,/^\"/p" switch2/build/package-portlib.sh | grep "^src/"
+    done
+}
+
+# As switch2/README.md builds OunceVK: the Rust standard library and the host
+# tools, then the Vulkan and the OpenGL Horizon builds.
+build() {
+    cd /work
+    export SRC=/work NVK_LIBOUNCE_NX=/ounce-nx PATH="/work/build/host-tools/bin:$PATH"
+    bash switch2/toolchain/rust/build-sysroot.sh
+    bash switch2/toolchain/build-host-tools.sh
+    bash switch2/build/configure-native-headless.sh
+    bash switch2/build/configure-gl.sh
+    nvk="src/nouveau/vulkan/libnvk.a src/nouveau/vulkan/libnvk_native_map.a"
+    ninja -C build/native-headless $nvk $(archives DRIVER_ARCHIVES)
+    ninja -C build/native-gl $nvk $(archives DRIVER_ARCHIVES GL_ARCHIVES)
+}
+
+package() {
+    cd /work
+    SRC=/work sh switch2/build/package-portlib.sh "$pkgdir/opt/devkitpro/portlibs/switch2"
+}
