@@ -6,7 +6,7 @@ use crate::ir::*;
 use crate::liveness::{BlockLiveness, LiveSet, Liveness, SimpleLiveness};
 use crate::opt_instr_sched_common::{
     calc_statistics, estimate_variable_latency, side_effect_type, DepGraph,
-    EdgeLabel, FutureReadyInstr, ReadyInstr, SideEffect,
+    EdgeLabel, FutureReadyInstr, MemoryOrder, ReadyInstr, SideEffect,
 };
 use rustc_hash::FxHashMap;
 use std::cmp::Reverse;
@@ -70,7 +70,7 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
 
     let mut defs = FxHashMap::<SSAValue, (usize, usize)>::default();
 
-    let mut last_memory_op = None;
+    let mut memory_order = MemoryOrder::default();
     let mut last_barrier_op = None;
     let mut last_carry_op = None;
 
@@ -91,10 +91,9 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
                 last_barrier_op = Some(ip);
             }
             SideEffect::Memory => {
-                if let Some(mem_ip) = last_memory_op {
-                    g.add_edge(mem_ip, ip, EdgeLabel { latency: 0 });
-                }
-                last_memory_op = Some(ip);
+                memory_order.add(ip, &instr.op, |other_ip| {
+                    g.add_edge(other_ip, ip, EdgeLabel { latency: 0 });
+                });
             }
         }
 

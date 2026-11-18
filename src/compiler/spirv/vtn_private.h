@@ -655,6 +655,12 @@ struct vtn_builder {
    struct nir_spirv_specialization *specialization;
 
    unsigned value_id_bound;
+
+   /* For each OpMatrixTimesMatrix result that may be reassociated, its two
+    * operand IDs, indexed by result ID; zero otherwise. Allocated on first
+    * use. See vtn_handle_alu.
+    */
+   uint32_t *matrix_product_operands;
    struct vtn_value *values;
 
    /* Information on the origin of the SPIR-V */

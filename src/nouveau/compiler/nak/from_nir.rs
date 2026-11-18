@@ -3633,9 +3633,18 @@ impl<'a> ShaderFromNir<'a> {
             nir_intrinsic_barrier => {
                 let modes = intrin.memory_modes();
                 let semantics = intrin.memory_semantics();
-                if (modes & nir_var_mem_global) != 0
-                    && (semantics & NIR_MEMORY_RELEASE) != 0
-                {
+                let within_subgroup = matches!(
+                    intrin.memory_scope(),
+                    SCOPE_INVOCATION | SCOPE_SUBGROUP
+                );
+                let within_workgroup =
+                    within_subgroup || intrin.memory_scope() == SCOPE_WORKGROUP;
+                // L1 write-back and invalidation make global memory visible
+                // across SMs. A workgroup runs on one SM and shares its L1:
+                // ptxas emits no CCTL for SM86 fence.cta.
+                let needs_cache_ops =
+                    (modes & nir_var_mem_global) != 0 && !within_workgroup;
+                if needs_cache_ops && (semantics & NIR_MEMORY_RELEASE) != 0 {
                     // Pre-Volta doesn't have WBAll but it also seems that we
                     // don't need it.
                     if self.sm.sm() >= 70 {
@@ -3659,31 +3668,44 @@ impl<'a> ShaderFromNir<'a> {
                     }
                     _ => panic!("Unhandled execution scope"),
                 }
-                if intrin.memory_scope() != SCOPE_NONE {
+                // On SM70 and later, two kinds of fence need no MEMBAR.
+                //
+                // Shared memory is on-chip per SM and processes each
+                // thread's accesses in order, so a fence that orders only
+                // shared memory within the workgroup is free. Shared
+                // accesses are Strong(CTA), which the schedulers keep in
+                // program order.
+                //
+                // A subgroup's threads run as one maximally convergent
+                // instruction stream through one SM, so a fence among them
+                // only has to keep the compiler from reordering, for any
+                // memory. The schedulers keep stores and atomics ordered
+                // against every access; reads may pass only reads.
+                //
+                // NVIDIA's Vulkan driver emits no MEMBAR in either case:
+                // memoryBarrierShared(), subgroupMemoryBarrierShared(),
+                // subgroupMemoryBarrierBuffer(), subgroupBarrier() or
+                // barrier().
+                let shared_only = (intrin.memory_modes() & !nir_var_mem_shared) == 0;
+                let fence_is_free = self.sm.sm() >= 70
+                    && (within_subgroup || (shared_only && within_workgroup));
+                let needs_membar =
+                    intrin.memory_scope() != SCOPE_NONE && !fence_is_free;
+                if needs_membar {
+                    // A workgroup runs on one SM, so a CTA fence orders its
+                    // global memory and images as well as shared memory:
+                    // ptxas compiles SM86 fence.cta, which covers global
+                    // memory, to MEMBAR.CTA.
                     let mem_scope = match intrin.memory_scope() {
-                        SCOPE_INVOCATION | SCOPE_SUBGROUP => MemScope::CTA,
-                        // A membar.gpu is very expensive so use .cta whenever
-                        // possible.
-                        // TODO: Figure out under which conditions we can relax
-                        //       them for global memory/images to CTA.
-                        SCOPE_WORKGROUP => {
-                            let global_modes = nir_var_image
-                                | nir_var_mem_global
-                                | nir_var_mem_ssbo;
-                            if intrin.memory_modes() & global_modes != 0 {
-                                MemScope::GPU
-                            } else {
-                                MemScope::CTA
-                            }
+                        SCOPE_INVOCATION | SCOPE_SUBGROUP | SCOPE_WORKGROUP => {
+                            MemScope::CTA
                         }
                         SCOPE_QUEUE_FAMILY | SCOPE_DEVICE => MemScope::GPU,
                         _ => panic!("Unhandled memory scope"),
                     };
                     b.push_op(OpMemBar { scope: mem_scope });
                 }
-                if (modes & nir_var_mem_global) != 0
-                    && (semantics & NIR_MEMORY_ACQUIRE) != 0
-                {
+                if needs_cache_ops && (semantics & NIR_MEMORY_ACQUIRE) != 0 {
                     b.push_op(OpCCtl {
                         op: CCtlOp::IVAll,
                         mem_space: MemSpace::Global(MemAddrType::A64),

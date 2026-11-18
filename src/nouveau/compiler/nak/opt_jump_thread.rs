@@ -109,15 +109,18 @@ fn jump_thread(func: &mut Function) -> bool {
     progress
 }
 
-fn rewrite_cfg(func: &mut Function) {
+/// Rebuilds the CFG from the blocks' fall-throughs and branches, removing
+/// unreachable blocks.
+pub(crate) fn rewrite_cfg(func: &mut Function) {
     // CFGBuilder takes care of removing dead blocks for us
     // We use the basic block's label to identify it
     let mut builder = CFGBuilder::<_, _, FxBuildHasher>::new();
 
     for i in 0..func.blocks.len() {
         let block = &func.blocks[i];
-        // Note: fall-though must be first edge
-        if block.falls_through() {
+        // Note: fall-though must be first edge. A last block that falls
+        // through is an unreachable, emptied one, which as_cfg removes.
+        if block.falls_through() && i + 1 < func.blocks.len() {
             let next_block = &func.blocks[i + 1];
             builder.add_edge(block.label, next_block.label);
         }
@@ -139,7 +142,7 @@ fn rewrite_cfg(func: &mut Function) {
 }
 
 /// Replace jumps to the following block with fall-through
-fn opt_fall_through(func: &mut Function) {
+pub(crate) fn opt_fall_through(func: &mut Function) {
     for i in 0..func.blocks.len() - 1 {
         let remove_last_instr = match func.blocks[i].branch() {
             Some(b) => match &b.op {

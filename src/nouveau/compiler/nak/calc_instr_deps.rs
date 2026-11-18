@@ -257,52 +257,61 @@ impl DepGraph {
     }
 }
 
+/// Assigns the six scoreboards. A scoreboard counts its outstanding
+/// instructions, and a wait on it waits for all of them, so one scoreboard
+/// can carry several dependencies: waiting for any of them then waits for
+/// all, which is correct but may wait longer than needed.
 struct BarAlloc {
     num_bars: u8,
-    bar_dep: [usize; 6],
+    bar_deps: [Vec<usize>; 6],
 }
 
 impl BarAlloc {
     pub fn new() -> BarAlloc {
         BarAlloc {
             num_bars: 6,
-            bar_dep: [usize::MAX; 6],
+            bar_deps: Default::default(),
         }
     }
 
     pub fn bar_is_free(&self, bar: u8) -> bool {
         debug_assert!(bar < self.num_bars);
-        self.bar_dep[usize::from(bar)] == usize::MAX
+        self.bar_deps[usize::from(bar)].is_empty()
     }
 
-    pub fn set_bar_dep(&mut self, bar: u8, dep: usize) {
-        debug_assert!(self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = dep;
+    pub fn add_bar_dep(&mut self, bar: u8, dep: usize) {
+        self.bar_deps[usize::from(bar)].push(dep);
     }
 
     pub fn free_bar(&mut self, bar: u8) {
         debug_assert!(!self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = usize::MAX;
+        self.bar_deps[usize::from(bar)].clear();
     }
 
     pub fn try_find_free_bar(&self) -> Option<u8> {
         (0..self.num_bars).find(|&bar| self.bar_is_free(bar))
     }
 
-    pub fn free_some_bar(&mut self) -> u8 {
-        // Get the oldest by looking for the one with the smallest dep
-        let mut bar = 0;
-        for b in 1..self.num_bars {
-            if self.bar_dep[usize::from(b)] < self.bar_dep[usize::from(bar)] {
-                bar = b;
-            }
-        }
-        self.free_bar(bar);
-        bar
+    /// With every scoreboard in use, picks the one whose newest dependency
+    /// is the youngest, other than `excluded`. A new dependency shares it
+    /// rather than making the instruction wait for the oldest scoreboard to
+    /// drain: consumers come roughly in producer order, so this one's are
+    /// the least likely to be delayed by the addition. NVIDIA's compiler
+    /// shares scoreboards the same way but never gives one instruction's
+    /// read and write the same scoreboard, so neither does this.
+    pub fn youngest_bar(&self, excluded: Option<u8>) -> u8 {
+        let newest = |bar: u8| {
+            self.bar_deps[usize::from(bar)].iter().copied().max().unwrap_or(0)
+        };
+        (0..self.num_bars)
+            .filter(|&bar| Some(bar) != excluded)
+            .max_by_key(|&bar| newest(bar))
+            .unwrap()
     }
 
     pub fn get_bar_for_dep(&self, dep: usize) -> Option<u8> {
-        (0..self.num_bars).find(|&bar| self.bar_dep[usize::from(bar)] == dep)
+        (0..self.num_bars)
+            .find(|&bar| self.bar_deps[usize::from(bar)].contains(&dep))
     }
 }
 
@@ -722,22 +731,20 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
             }
 
             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
+            let mut rd_bar = None;
             if deps.dep_is_waited_after(rd_dep, bi, ip) {
-                let rd_bar = bars.try_find_free_bar().unwrap_or_else(|| {
-                    let bar = bars.free_some_bar();
-                    instr.deps.add_wt_bar(bar);
-                    bar
-                });
-                bars.set_bar_dep(rd_bar, rd_dep);
-                instr.deps.set_rd_bar(rd_bar);
+                let bar = bars
+                    .try_find_free_bar()
+                    .unwrap_or_else(|| bars.youngest_bar(None));
+                bars.add_bar_dep(bar, rd_dep);
+                instr.deps.set_rd_bar(bar);
+                rd_bar = Some(bar);
             }
             if deps.dep_is_waited_after(wr_dep, bi, ip) {
-                let wr_bar = bars.try_find_free_bar().unwrap_or_else(|| {
-                    let bar = bars.free_some_bar();
-                    instr.deps.add_wt_bar(bar);
-                    bar
-                });
-                bars.set_bar_dep(wr_bar, wr_dep);
+                let wr_bar = bars
+                    .try_find_free_bar()
+                    .unwrap_or_else(|| bars.youngest_bar(rd_bar));
+                bars.add_bar_dep(wr_bar, wr_dep);
                 instr.deps.set_wr_bar(wr_bar);
             }
         }

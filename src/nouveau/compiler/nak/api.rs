@@ -524,8 +524,15 @@ fn nak_compile_shader_internal(
     pass!(s, opt_lop);
     pass!(s, opt_copy_prop);
     pass!(s, opt_dce);
+    pass!(s, opt_if_convert);
     pass!(s, opt_out);
     pass!(s, legalize);
+    if s.opt_uniform_copies() {
+        if DEBUG.print() {
+            eprintln!("NAK IR after opt_uniform_copies:\n{}", s);
+        }
+        pass!(s, legalize);
+    }
     pass!(s, opt_dce);
     pass!(s, opt_instr_sched_prepass);
     pass!(s, assign_regs);

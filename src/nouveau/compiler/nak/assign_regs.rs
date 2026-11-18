@@ -84,12 +84,15 @@ enum SSAUse {
 
 struct SSAUseMap {
     ssa_map: FxHashMap<SSAValue, Vec<(usize, SSAUse)>>,
+    /// The GPRs that values must reach for the block's OpRegOut.
+    fixed_regs: Vec<u32>,
 }
 
 impl SSAUseMap {
     fn add_fixed_reg_use(&mut self, ip: usize, ssa: SSAValue, reg: u32) {
         let v = self.ssa_map.entry(ssa).or_default();
         v.push((ip, SSAUse::FixedReg(reg)));
+        self.fixed_regs.push(reg);
     }
 
     fn add_vec_use(&mut self, ip: usize, vec: &[SSAValue]) {
@@ -101,6 +104,23 @@ impl SSAUseMap {
             let v = self.ssa_map.entry(*ssa).or_default();
             v.push((ip, SSAUse::Vec(SSARef::new(vec))));
         }
+    }
+
+    /// If every component of `vec` next goes to consecutive OpRegOut
+    /// registers, returns the first of them.
+    fn fixed_vec_reg_after(&self, vec: &[SSAValue], ip: usize) -> Option<u32> {
+        let mut base = None;
+        for (c, ssa) in vec.iter().enumerate() {
+            let Some(SSAUse::FixedReg(reg)) = self.find_vec_use_after(*ssa, ip)
+            else {
+                return None;
+            };
+            let comp_base = reg.checked_sub(u32::try_from(c).unwrap())?;
+            if *base.get_or_insert(comp_base) != comp_base {
+                return None;
+            }
+        }
+        base
     }
 
     fn find_vec_use_after(&self, ssa: SSAValue, ip: usize) -> Option<&SSAUse> {
@@ -118,6 +138,10 @@ impl SSAUseMap {
     }
 
     pub fn add_block(&mut self, b: &BasicBlock) {
+        // A copy's destination that a vector or output then needs passes the
+        // need on to the copy's source: if the source is placed there, the
+        // copy coalesces away. Maps copy destinations to sources.
+        let mut copy_srcs: FxHashMap<SSAValue, SSAValue> = Default::default();
         for (ip, instr) in b.instrs.iter().enumerate() {
             match &instr.op {
                 Op::RegOut(op) => {
@@ -126,14 +150,38 @@ impl SSAUseMap {
                         if let Some(ssa) = src_ssa_ref(src) {
                             assert!(ssa.len() == 1);
                             self.add_fixed_reg_use(ip, ssa[0], out_reg);
+                            if let Some(copy_src) = copy_srcs.get(&ssa[0]) {
+                                self.add_fixed_reg_use(ip, *copy_src, out_reg);
+                            }
                         }
                     }
                 }
                 _ => {
+                    if let Op::Copy(copy) = &instr.op {
+                        if let (Dst::SSA(dst), Some(src)) =
+                            (&copy.dst, src_ssa_ref(&copy.src))
+                        {
+                            if dst.comps() == 1
+                                && src.len() == 1
+                                && dst[0].file() == src[0].file()
+                            {
+                                copy_srcs.insert(dst[0], src[0]);
+                            }
+                        }
+                    }
                     // We don't care about predicates because they're scalar
                     for src in instr.srcs() {
                         if let Some(ssa) = src_ssa_ref(src) {
                             self.add_vec_use(ip, ssa);
+                            if ssa.len() > 1
+                                && ssa.iter().any(|c| copy_srcs.contains_key(c))
+                            {
+                                let sources: Vec<SSAValue> = ssa
+                                    .iter()
+                                    .map(|c| *copy_srcs.get(c).unwrap_or(c))
+                                    .collect();
+                                self.add_vec_use(ip, &sources);
+                            }
                         }
                     }
                 }
@@ -144,6 +192,7 @@ impl SSAUseMap {
     pub fn for_block(b: &BasicBlock) -> SSAUseMap {
         let mut am = SSAUseMap {
             ssa_map: Default::default(),
+            fixed_regs: Vec::new(),
         };
         am.add_block(b);
         am
@@ -264,6 +313,11 @@ struct RegAllocator {
     pinned: BitSet,
     reg_ssa: Vec<Option<SSAValue>>,
     ssa_reg: FxHashMap<SSAValue, u32>,
+    /// Registers planned for vector components not yet defined. When one
+    /// component of a vector that an instruction reads is placed, the
+    /// others' registers are reserved so that unrelated values leave them
+    /// free, and the vector needs no moves to collect it.
+    reserved: FxHashMap<SSAValue, u32>,
 }
 
 impl RegAllocator {
@@ -275,6 +329,7 @@ impl RegAllocator {
             pinned: Default::default(),
             reg_ssa: Vec::new(),
             ssa_reg: Default::default(),
+            reserved: Default::default(),
         }
     }
 
@@ -348,6 +403,33 @@ impl RegAllocator {
         let old = self.ssa_reg.insert(ssa, reg);
         assert!(old.is_none());
         self.used.insert(reg_usize);
+
+        // The value's own reservation is fulfilled or abandoned, and one
+        // that another value held on this register is broken.
+        if !self.reserved.is_empty() {
+            self.reserved.remove(&ssa);
+            self.reserved.retain(|_, reserved_reg| *reserved_reg != reg);
+        }
+    }
+
+    /// Reserves the registers of the components of `vec` that have none
+    /// yet, given that component `comp` is in `reg`.
+    fn reserve_vec_comps(&mut self, vec: &SSARef, comp: u8, reg: u32) {
+        let base = reg - u32::from(comp);
+        for c in 0..vec.comps() {
+            let ssa = vec[usize::from(c)];
+            let comp_reg = base + u32::from(c);
+            if c == comp
+                || comp_reg >= self.num_regs
+                || self.reg_is_used(comp_reg)
+                || self.ssa_reg.contains_key(&ssa)
+                || self.reserved.contains_key(&ssa)
+                || self.reserved.values().any(|r| *r == comp_reg)
+            {
+                continue;
+            }
+            self.reserved.insert(ssa, comp_reg);
+        }
     }
 
     pub fn pin_reg(&mut self, reg: u32) {
@@ -402,6 +484,41 @@ impl RegAllocator {
         )
     }
 
+    /// Finds a free range for a value with no register of its own to aim
+    /// for. It prefers registers that are neither reserved for vector
+    /// components nor needed by the block's OpRegOut, then registers that
+    /// are only not reserved, then any: a value placed in a planned
+    /// register would make the vector or output that needs it move later.
+    fn find_unused_reg_range_avoiding_plans(
+        &self,
+        sum: &SSAUseMap,
+        comps: u8,
+        align_mul: u8,
+    ) -> Option<u32> {
+        let mut avoid = self.used.clone();
+        for reg in self.reserved.values() {
+            avoid.insert((*reg).try_into().unwrap());
+        }
+        if self.file == RegFile::GPR && !sum.fixed_regs.is_empty() {
+            let mut avoid_outputs = avoid.clone();
+            for reg in &sum.fixed_regs {
+                avoid_outputs.insert((*reg).try_into().unwrap());
+            }
+            let reg = self
+                .try_find_unset_reg_range(&avoid_outputs, 0, comps, align_mul, 0);
+            if reg.is_some() {
+                return reg;
+            }
+        }
+        if !self.reserved.is_empty() {
+            let reg = self.try_find_unset_reg_range(&avoid, 0, comps, align_mul, 0);
+            if reg.is_some() {
+                return reg;
+            }
+        }
+        self.try_find_unused_reg_range(0, comps, align_mul, 0)
+    }
+
     pub fn alloc_scalar(
         &mut self,
         ip: usize,
@@ -411,6 +528,14 @@ impl RegAllocator {
     ) -> u32 {
         // Bias register assignment using the phi coalescing
         if let Some(reg) = phi_webs.get(ssa) {
+            if !self.reg_is_used(reg) {
+                self.assign_reg(ssa, reg);
+                return reg;
+            }
+        }
+
+        // A component of a vector whose other components are placed
+        if let Some(&reg) = self.reserved.get(&ssa) {
             if !self.reg_is_used(reg) {
                 self.assign_reg(ssa, reg);
                 return reg;
@@ -455,6 +580,7 @@ impl RegAllocator {
                         let reg = vec_reg + u32::from(comp);
                         if reg < self.num_regs && !self.reg_is_used(reg) {
                             self.assign_reg(ssa, reg);
+                            self.reserve_vec_comps(vec, comp, reg);
                             return reg;
                         }
                     }
@@ -462,11 +588,16 @@ impl RegAllocator {
                     // We weren't able to pair it with an already allocated
                     // register but maybe we can at least find a place the vec
                     // would fit
-                    if let Some(base_reg) =
-                        self.try_find_unused_reg_range(0, vec.comps(), align, 0)
+                    if let Some(base_reg) = self
+                        .find_unused_reg_range_avoiding_plans(
+                            sum,
+                            vec.comps(),
+                            align,
+                        )
                     {
                         let reg = base_reg + u32::from(comp);
                         self.assign_reg(ssa, reg);
+                        self.reserve_vec_comps(vec, comp, reg);
                         return reg;
                     }
                 }
@@ -474,7 +605,7 @@ impl RegAllocator {
         }
 
         let reg = self
-            .try_find_unused_reg_range(0, 1, 1, 0)
+            .find_unused_reg_range_avoiding_plans(sum, 1, 1)
             .expect("Failed to find free register");
         self.assign_reg(ssa, reg);
         reg
@@ -680,8 +811,37 @@ impl<'a> VecRegAllocator<'a> {
     }
 
     pub fn alloc_vector(&mut self, vec: &SSARef) -> RegRef {
+        self.alloc_vector_for_uses(vec, None)
+    }
+
+    /// Allocates a vector destination. With the block's use map, the vector
+    /// goes where an OpRegOut needs it if that range is free, and otherwise
+    /// avoids the registers the block's OpRegOut needs.
+    pub fn alloc_vector_for_uses(
+        &mut self,
+        vec: &SSARef,
+        uses: Option<(&SSAUseMap, usize)>,
+    ) -> RegRef {
         let comps = vec.comps();
         let align = comps.next_power_of_two();
+
+        if let Some((sum, ip)) = uses {
+            if let Some(reg) = sum.fixed_vec_reg_after(vec, ip) {
+                let aligned = reg % u32::from(align) == 0;
+                if aligned
+                    && reg + u32::from(comps) <= self.ra.num_regs
+                    && self.ra.try_find_unused_reg_range(reg, comps, align, 0)
+                        == Some(reg)
+                {
+                    return self.assign_pin_vec_reg(vec, reg);
+                }
+            }
+            if let Some(reg) =
+                self.ra.find_unused_reg_range_avoiding_plans(sum, comps, align)
+            {
+                return self.assign_pin_vec_reg(vec, reg);
+            }
+        }
 
         if let Some(reg) = self.ra.try_find_unused_reg_range(0, comps, align, 0)
         {
@@ -773,6 +933,8 @@ fn instr_assign_regs_file(
         comps: u8,
         killed: Option<SSARef>,
         reg: u32,
+        /// The registers an OpRegOut later needs this vector in, if any.
+        output_reg: Option<u32>,
     }
 
     let mut vec_dsts = Vec::new();
@@ -785,6 +947,7 @@ fn instr_assign_regs_file(
                     comps: ssa.comps(),
                     killed: None,
                     reg: u32::MAX,
+                    output_reg: sum.fixed_vec_reg_after(ssa, ip),
                 });
                 vec_dst_comps += ssa.comps();
             }
@@ -831,7 +994,9 @@ fn instr_assign_regs_file(
     vec_dsts.sort_by_key(|v| v.comps);
     killed_vecs.sort_by_key(|v| v.comps());
 
-    let mut next_dst_reg = 0;
+    // Free registers for the trivial allocation below. A vector that an
+    // OpRegOut needs in fixed registers takes them if they are free.
+    let mut free_for_dsts = ra.used.clone();
     let mut vec_dsts_map_to_killed_srcs = true;
     let mut could_trivially_allocate = true;
     for vec_dst in vec_dsts.iter_mut().rev() {
@@ -846,11 +1011,19 @@ fn instr_assign_regs_file(
         }
 
         let align = vec_dst.comps.next_power_of_two();
-        if let Some(reg) =
-            ra.try_find_unused_reg_range(next_dst_reg, vec_dst.comps, align, 0)
-        {
+        let wanted = vec_dst.output_reg.filter(|&reg| {
+            reg % u32::from(align) == 0
+                && ra.try_find_unset_reg_range(&free_for_dsts, reg, vec_dst.comps, align, 0)
+                    == Some(reg)
+        });
+        let reg = wanted.or_else(|| {
+            ra.try_find_unset_reg_range(&free_for_dsts, 0, vec_dst.comps, align, 0)
+        });
+        if let Some(reg) = reg {
             vec_dst.reg = reg;
-            next_dst_reg = reg + u32::from(vec_dst.comps);
+            for c in 0..u32::from(vec_dst.comps) {
+                free_for_dsts.insert((reg + c).try_into().unwrap());
+            }
         } else {
             could_trivially_allocate = false;
         }
@@ -899,7 +1072,7 @@ fn instr_assign_regs_file(
         for dst in instr.dsts_mut() {
             if let Dst::SSA(ssa) = dst {
                 if ssa.file() == vra.file() && ssa.comps() > 1 {
-                    *dst = vra.alloc_vector(ssa).into();
+                    *dst = vra.alloc_vector_for_uses(ssa, Some((sum, ip))).into();
                 }
             }
         }

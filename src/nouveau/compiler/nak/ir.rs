@@ -8723,10 +8723,6 @@ impl InstrDeps {
         self.wr_bar = idx.try_into().unwrap();
     }
 
-    pub fn add_wt_bar(&mut self, idx: u8) {
-        self.add_wt_bar_mask(1 << idx);
-    }
-
     pub fn add_wt_bar_mask(&mut self, bar_mask: u8) {
         assert!(bar_mask < 1 << 6);
         self.wt_bar_mask |= bar_mask;

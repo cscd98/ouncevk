@@ -40,7 +40,7 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
     let mut uses: Box<RegTracker<RegUse<(usize, usize)>>> =
         Box::new(RegTracker::new_with(&|| RegUse::new()));
 
-    let mut last_memory_op = None;
+    let mut memory_order = MemoryOrder::default();
     let mut last_barrier_op = None;
 
     for ip in (0..instrs.len()).rev() {
@@ -60,10 +60,9 @@ fn generate_dep_graph(sm: &ShaderModelInfo, instrs: &[Instr]) -> DepGraph {
                 last_barrier_op = Some(ip);
             }
             SideEffect::Memory => {
-                if let Some(mem_ip) = last_memory_op {
-                    g.add_edge(ip, mem_ip, EdgeLabel { latency: 0 });
-                }
-                last_memory_op = Some(ip);
+                memory_order.add(ip, &instr.op, |other_ip| {
+                    g.add_edge(ip, other_ip, EdgeLabel { latency: 0 });
+                });
             }
         }
 

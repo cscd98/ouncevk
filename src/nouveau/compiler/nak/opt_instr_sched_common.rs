@@ -81,6 +81,55 @@ pub enum SideEffect {
     Barrier,
 }
 
+/// Whether a memory instruction only reads memory that it may read in any
+/// order relative to other such reads: weak and constant loads and texture
+/// fetches. Strong (coherent or atomic) loads stay in program order, so that
+/// two reads of one location cannot return values out of order.
+pub fn is_reorderable_read(op: &Op) -> bool {
+    match op {
+        Op::Ld(ld) => {
+            matches!(ld.access.order, MemOrder::Constant | MemOrder::Weak)
+        }
+        Op::Tex(_)
+        | Op::Tld(_)
+        | Op::Tld4(_)
+        | Op::Tmml(_)
+        | Op::Txd(_)
+        | Op::Txq(_) => true,
+        _ => false,
+    }
+}
+
+/// Orders the SideEffect::Memory instructions of a block for a scheduler.
+/// Reorderable reads (is_reorderable_read) are ordered only against the
+/// other memory instructions; those are ordered against everything, as a
+/// store must not pass a load that may read its location. The rule is
+/// symmetric, so a pass may visit the instructions in either direction.
+#[derive(Default)]
+pub struct MemoryOrder {
+    last_ordered: Option<usize>,
+    reads: Vec<usize>,
+}
+
+impl MemoryOrder {
+    /// Records memory instruction `ip` and calls `order(other)` for each
+    /// earlier-visited instruction that `ip` must stay ordered with.
+    pub fn add(&mut self, ip: usize, op: &Op, mut order: impl FnMut(usize)) {
+        if let Some(other) = self.last_ordered {
+            order(other);
+        }
+        if is_reorderable_read(op) {
+            self.reads.push(ip);
+        } else {
+            for &read in &self.reads {
+                order(read);
+            }
+            self.reads.clear();
+            self.last_ordered = Some(ip);
+        }
+    }
+}
+
 pub fn side_effect_type(op: &Op) -> SideEffect {
     match op {
         // Float ALU
@@ -208,9 +257,13 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
         // Geometry ops
         Op::Out(_) | Op::OutFinal(_) => SideEffect::Barrier,
 
+        // A workgroup barrier orders memory, not computation: ALU
+        // instructions may move across it. As a memory instruction that is
+        // not a reorderable read, it stays ordered against every access.
+        Op::Bar(_) => SideEffect::Memory,
+
         // Miscellaneous ops
-        Op::Bar(_)
-        | Op::TexDepBar(_)
+        Op::TexDepBar(_)
         | Op::CS2R(_)
         | Op::Isberd(_)
         | Op::Isbewr(_)

@@ -738,6 +738,66 @@ vtn_handle_convert(struct vtn_builder *b, SpvOp opcode,
    return result;
 }
 
+/* Records that the matrix with ID `product` is operand_a * operand_b, so a
+ * later matrix-vector product with it may be reassociated.
+ */
+static void
+record_matrix_product(struct vtn_builder *b, uint32_t product,
+                      uint32_t operand_a, uint32_t operand_b)
+{
+   if (b->matrix_product_operands == NULL) {
+      b->matrix_product_operands =
+         rzalloc_array(b, uint32_t, 2 * b->value_id_bound);
+   }
+   b->matrix_product_operands[2 * product] = operand_a;
+   b->matrix_product_operands[2 * product + 1] = operand_b;
+}
+
+static bool
+lookup_matrix_product(struct vtn_builder *b, uint32_t matrix,
+                      uint32_t *operand_a, uint32_t *operand_b)
+{
+   if (b->matrix_product_operands == NULL ||
+       b->matrix_product_operands[2 * matrix] == 0)
+      return false;
+   *operand_a = b->matrix_product_operands[2 * matrix];
+   *operand_b = b->matrix_product_operands[2 * matrix + 1];
+   return true;
+}
+
+/* Computes matrix * vector, where the matrix may be a recorded product:
+ * (A * B) * v becomes A * (B * v), recursively. A chain such as
+ * projection * view * model * position then costs three matrix-vector
+ * products instead of two matrix-matrix products and one matrix-vector
+ * product. GLSL allows reordering operations that are not precise; NVIDIA's
+ * compiler does the same.
+ */
+static struct vtn_ssa_value *
+matrix_times_vector(struct vtn_builder *b, uint32_t matrix,
+                    struct vtn_ssa_value *vector)
+{
+   uint32_t operand_a, operand_b;
+   if (lookup_matrix_product(b, matrix, &operand_a, &operand_b)) {
+      return matrix_times_vector(b, operand_a,
+                                 matrix_times_vector(b, operand_b, vector));
+   }
+   return matrix_multiply(b, vtn_ssa_value(b, matrix), vector);
+}
+
+/* Computes vector * matrix; v * (A * B) becomes (v * A) * B. */
+static struct vtn_ssa_value *
+vector_times_matrix(struct vtn_builder *b, struct vtn_ssa_value *vector,
+                    uint32_t matrix)
+{
+   uint32_t operand_a, operand_b;
+   if (lookup_matrix_product(b, matrix, &operand_a, &operand_b)) {
+      return vector_times_matrix(b, vector_times_matrix(b, vector, operand_a),
+                                 operand_b);
+   }
+   return matrix_multiply(b, vtn_ssa_transpose(b, vtn_ssa_value(b, matrix)),
+                          vector);
+}
+
 void
 vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
                const uint32_t *w, unsigned count)
@@ -766,7 +826,21 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
 
    if (glsl_type_is_matrix(vtn_src[0]->type) ||
        (num_inputs >= 2 && glsl_type_is_matrix(vtn_src[1]->type))) {
-      struct vtn_ssa_value *dest = vtn_handle_matrix_alu(b, opcode, vtn_src[0], vtn_src[1]);
+      /* Matrix products may be reassociated unless the result is exact
+       * (NoContraction) or computed at reduced precision.
+       */
+      const bool reassociate =
+         !mediump_16bit && !(b->nb.fp_math_ctrl & nir_fp_exact);
+      struct vtn_ssa_value *dest;
+      if (reassociate && opcode == SpvOpMatrixTimesVector) {
+         dest = matrix_times_vector(b, w[3], vtn_src[1]);
+      } else if (reassociate && opcode == SpvOpVectorTimesMatrix) {
+         dest = vector_times_matrix(b, vtn_src[0], w[4]);
+      } else {
+         dest = vtn_handle_matrix_alu(b, opcode, vtn_src[0], vtn_src[1]);
+      }
+      if (reassociate && opcode == SpvOpMatrixTimesMatrix)
+         record_matrix_product(b, w[2], w[3], w[4]);
 
       if (mediump_16bit)
          dest = vtn_mediump_upconvert_value(b, dest);
