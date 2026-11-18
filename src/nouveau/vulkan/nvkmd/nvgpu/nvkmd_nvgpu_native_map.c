@@ -6,6 +6,7 @@
 #include "nvkmd_nvgpu_native_backing.h"
 
 #include "util/log.h"
+#include <ouncevk/profile.h>
 
 #include <assert.h>
 #include <stdlib.h>
@@ -137,20 +138,40 @@ nvkmd_nvgpu_native_slot_settle(struct nvkmd_nvgpu_native_slot *slot,
    return false;
 }
 
+/* The profile timer of a slot request. */
+static enum ouncevk_profile_timer
+slot_request_timer(enum nvkmd_nvgpu_native_slot_request request)
+{
+   switch (request) {
+   case NVKMD_NVGPU_NATIVE_SLOT_MAP:
+      return OUNCEVK_PROFILE_SERVICE_MAP;
+   case NVKMD_NVGPU_NATIVE_SLOT_CHANGE_KIND:
+      return OUNCEVK_PROFILE_SERVICE_KIND;
+   case NVKMD_NVGPU_NATIVE_SLOT_UNREGISTER:
+      return OUNCEVK_PROFILE_SERVICE_UNREGISTER;
+   case NVKMD_NVGPU_NATIVE_SLOT_UNMAP:
+   case NVKMD_NVGPU_NATIVE_SLOT_IDLE:
+      break;
+   }
+   return OUNCEVK_PROFILE_SERVICE_UNMAP;
+}
+
 enum nvkmd_nvgpu_native_slot_outcome
 nvkmd_nvgpu_native_slot_finish(
-   struct nvkmd_nvgpu_native_slot *slot, Result send_result,
+   struct nvkmd_nvgpu_native_slot *slot, uint64_t sent_at,
+   Result send_result,
    const struct nvkmd_nvgpu_native_slot_pending *request,
    Result *result_out)
 {
    *result_out = send_result;
+   if (R_SUCCEEDED(send_result))
+      *result_out = slot_wait(slot);
+   ouncevk_profile_record(slot_request_timer(request->request),
+                          armGetSystemTick() - sent_at);
    if (R_FAILED(send_result) && !send_failed_in_transport(send_result))
       return NVKMD_NVGPU_NATIVE_SLOT_REFUSED;
-   if (R_SUCCEEDED(send_result)) {
-      *result_out = slot_wait(slot);
-      if (R_SUCCEEDED(*result_out))
-         return NVKMD_NVGPU_NATIVE_SLOT_COMPLETED;
-   }
+   if (R_SUCCEEDED(send_result) && R_SUCCEEDED(*result_out))
+      return NVKMD_NVGPU_NATIVE_SLOT_COMPLETED;
    slot->pending = *request;
    slot->pending.acceptance_unknown = R_FAILED(send_result);
    slot->pending.result = *result_out;
@@ -243,12 +264,13 @@ nvkmd_nvgpu_native_map_once(struct nvkmd_nvgpu_native_map_owner *map,
       .client = runtime->vm.client,
    };
    u8 selected_kind = 0;
+   const uint64_t sent_at = armGetSystemTick();
    rc = gsvGpuMap(&runtime->gpu, &mapping, slot->index, &selected_kind);
    const struct nvkmd_nvgpu_native_slot_pending request = {
       .request = NVKMD_NVGPU_NATIVE_SLOT_MAP,
    };
    const enum nvkmd_nvgpu_native_slot_outcome outcome =
-      nvkmd_nvgpu_native_slot_finish(slot, rc, &request, &rc);
+      nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, &rc);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_REPLY, rc);
    /* The worker accepted the request, or may have: the mapping exists, will
@@ -292,6 +314,7 @@ nvkmd_nvgpu_native_map_modify_kind(struct nvkmd_nvgpu_native_map_owner *map,
 
    map->modify_failed = true; /* cleared only by a verified completion */
    u8 selected_kind = 0;
+   const uint64_t sent_at = armGetSystemTick();
    rc = gsvGpuChangeKind(&runtime->gpu, map->vm_id, map->gpu_va + offset_B,
                          size_B, kind, slot->index, &selected_kind);
    const struct nvkmd_nvgpu_native_slot_pending request = {
@@ -299,7 +322,7 @@ nvkmd_nvgpu_native_map_modify_kind(struct nvkmd_nvgpu_native_map_owner *map,
    };
    /* Success needs both a success reply and the completion of the slot. */
    const enum nvkmd_nvgpu_native_slot_outcome outcome =
-      nvkmd_nvgpu_native_slot_finish(slot, rc, &request, &rc);
+      nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, &rc);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_REPLY, rc);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED)
@@ -333,6 +356,7 @@ nvkmd_nvgpu_native_map_unmap(struct nvkmd_nvgpu_native_map_owner *map,
    /* No more use of the map. It stays mapped until the unmap completes: a
     * refused unmap can be sent again. */
    map->ready = false;
+   const uint64_t sent_at = armGetSystemTick();
    rc = gsvGpuUnmap(&runtime->gpu, map->vm_id, map->gpu_va, map->length,
                     slot->index);
    const struct nvkmd_nvgpu_native_slot_pending request = {
@@ -343,7 +367,7 @@ nvkmd_nvgpu_native_map_unmap(struct nvkmd_nvgpu_native_map_owner *map,
       .size_B = map->length,
    };
    const enum nvkmd_nvgpu_native_slot_outcome outcome =
-      nvkmd_nvgpu_native_slot_finish(slot, rc, &request, &rc);
+      nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, &rc);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
       return map_fail(map, NVKMD_NVGPU_NATIVE_MAP_REPLY, rc);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED)
@@ -390,13 +414,14 @@ nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
       .client = runtime->vm.client,
    };
    u8 selected_kind = 0;
+   const uint64_t sent_at = armGetSystemTick();
    const Result rc =
       gsvGpuMap(&runtime->gpu, &mapping, slot->index, &selected_kind);
    const struct nvkmd_nvgpu_native_slot_pending request = {
       .request = NVKMD_NVGPU_NATIVE_SLOT_MAP,
    };
    const enum nvkmd_nvgpu_native_slot_outcome outcome =
-      nvkmd_nvgpu_native_slot_finish(slot, rc, &request, result_out);
+      nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, result_out);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
       return NVKMD_NVGPU_NATIVE_MAP_REPLY;
    /* The worker accepted the request, or may have: the mapping exists, will
@@ -438,6 +463,7 @@ nvkmd_nvgpu_native_unmap_range(struct nvkmd_nvgpu_native_runtime *runtime,
       *result_out = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
       return NVKMD_NVGPU_NATIVE_MAP_SLOT;
    }
+   const uint64_t sent_at = armGetSystemTick();
    const Result rc = gsvGpuUnmap(&runtime->gpu, runtime->vm.id, gpu_va,
                                  size_B, slot->index);
    const struct nvkmd_nvgpu_native_slot_pending request = {
@@ -447,7 +473,7 @@ nvkmd_nvgpu_native_unmap_range(struct nvkmd_nvgpu_native_runtime *runtime,
       .size_B = size_B,
    };
    const enum nvkmd_nvgpu_native_slot_outcome outcome =
-      nvkmd_nvgpu_native_slot_finish(slot, rc, &request, result_out);
+      nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, result_out);
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
       return NVKMD_NVGPU_NATIVE_MAP_REPLY;
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED)

@@ -15,6 +15,8 @@
 #include "nvkmd_nvgpu_native_backing.h"
 #include "nvkmd_nvgpu_native_device_owner.h"
 #include "nvkmd_nvgpu_native_pdev.h"
+#include "nvkmd_nvgpu_native_profile_log.h"
+#include "nvkmd_nvgpu_native_chunk_reserve.h"
 
 #include "util/log.h"
 #include "util/simple_mtx.h"
@@ -274,6 +276,9 @@ native_close_device(bool at_exit)
 {
    if (!native_device.attempted)
       return 0;
+   /* The log and the chunk reserve use the device: they stop first. */
+   nvkmd_nvgpu_native_profile_log_stop();
+   nvkmd_nvgpu_native_chunk_reserve_stop();
    if (!native_device_closed) {
       const enum nvkmd_nvgpu_native_device_close_status status = at_exit ?
          nvkmd_nvgpu_native_device_close_at_exit(&native_device) :
@@ -403,6 +408,8 @@ native_open_locked(struct vk_object_base *log_obj)
                        "Native GPU device unavailable: stage=%u result=0x%x",
                        (unsigned)native_device.stage,
                        native_device.last_result);
+   nvkmd_nvgpu_native_profile_log_start(&native_device);
+   nvkmd_nvgpu_native_chunk_reserve_start(&native_device);
    return VK_SUCCESS;
 }
 
@@ -463,12 +470,24 @@ ouncevk_profile_record(enum ouncevk_profile_timer timer, uint64_t ticks)
        !native_device_usable() || !nvkmd_nvgpu_native_owner_lock(d))
       return;
    const uint64_t us = armTicksToNs(ticks) / 1000;
-   struct ouncevk_profile_timer_stats *stats = &d->profile_timers[timer];
-   stats->count++;
-   stats->total_us += us;
-   stats->max_us = MAX2(stats->max_us, us);
-   stats->buckets[native_profile_bucket(us)]++;
+   struct ouncevk_profile_timer_stats *const sets[] = {
+      &d->profile_timers[timer],
+      &d->log_timers[timer],
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(sets); i++) {
+      struct ouncevk_profile_timer_stats *stats = sets[i];
+      stats->count++;
+      stats->total_us += us;
+      stats->max_us = MAX2(stats->max_us, us);
+      stats->buckets[native_profile_bucket(us)]++;
+   }
    nvkmd_nvgpu_native_owner_unlock(d);
+}
+
+void
+ouncevk_profile_record_ns(enum ouncevk_profile_timer timer, uint64_t ns)
+{
+   ouncevk_profile_record(timer, armNsToTicks(ns));
 }
 
 bool
@@ -506,6 +525,17 @@ ouncevk_profile_timer_name(enum ouncevk_profile_timer timer)
    case OUNCEVK_PROFILE_JOIN: return "join";
    case OUNCEVK_PROFILE_ACQUIRE: return "acquire";
    case OUNCEVK_PROFILE_PRESENT: return "present";
+   case OUNCEVK_PROFILE_SUBMIT: return "submit";
+   case OUNCEVK_PROFILE_ALLOCATE: return "allocate";
+   case OUNCEVK_PROFILE_SERVICE_MAP: return "service-map";
+   case OUNCEVK_PROFILE_SERVICE_UNMAP: return "service-unmap";
+   case OUNCEVK_PROFILE_SERVICE_KIND: return "service-kind";
+   case OUNCEVK_PROFILE_SERVICE_REGISTER: return "service-register";
+   case OUNCEVK_PROFILE_SERVICE_UNREGISTER: return "service-unregister";
+   case OUNCEVK_PROFILE_BACKING_HEAP: return "backing-heap";
+   case OUNCEVK_PROFILE_BACKING_CLEAR: return "backing-clear";
+   case OUNCEVK_PROFILE_BACKING_MARK: return "backing-mark";
+   case OUNCEVK_PROFILE_BACKING_UNCACHE: return "backing-uncache";
    default: return "unknown";
    }
 }

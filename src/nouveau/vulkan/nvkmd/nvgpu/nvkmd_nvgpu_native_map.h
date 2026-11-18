@@ -101,13 +101,15 @@ bool nvkmd_nvgpu_native_slot_close(struct nvkmd_nvgpu_native_slot *slot);
 bool nvkmd_nvgpu_native_slot_settle(struct nvkmd_nvgpu_native_slot *slot,
                                     Result *result_out);
 
-/* Call after every send on the slot, with the send's Result and what the
- * request's completion changes. Waits, without a limit, for the completion
- * of an accepted request; a wait that times out is repeated. *result_out
- * is the Result of the send, or of the wait when that failed. The caller
- * makes the change itself when the outcome is COMPLETED. */
+/* Call after every send on the slot, with the system tick just before the
+ * send, the send's Result and what the request's completion changes. Waits,
+ * without a limit, for the completion of an accepted request; a wait that
+ * times out is repeated. *result_out is the Result of the send, or of the
+ * wait when that failed. The caller makes the change itself when the
+ * outcome is COMPLETED. The request's time goes to the profile. */
 enum nvkmd_nvgpu_native_slot_outcome nvkmd_nvgpu_native_slot_finish(
-   struct nvkmd_nvgpu_native_slot *slot, Result send_result,
+   struct nvkmd_nvgpu_native_slot *slot, uint64_t sent_at,
+   Result send_result,
    const struct nvkmd_nvgpu_native_slot_pending *request,
    Result *result_out);
 

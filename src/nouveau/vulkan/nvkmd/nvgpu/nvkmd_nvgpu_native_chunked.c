@@ -3,6 +3,7 @@
  * nvkmd_nvgpu_native_chunked.h.
  */
 #include "nvkmd_nvgpu_native_chunked.h"
+#include "nvkmd_nvgpu_native_chunk_reserve.h"
 #include "nvkmd_nvgpu_native_map.h"
 
 #include "util/log.h"
@@ -16,6 +17,9 @@
  * free returns chunks to the process heap (after a finish flush, because
  * the GPU L2 can still hold their lines). */
 #define NATIVE_CHUNK_POOL_B (UINT64_C(128) * 1024 * 1024)
+/* The most free chunks that the reserve keeps ready (see
+ * nvkmd_nvgpu_native_chunk_reserve.h). */
+#define NATIVE_CHUNK_RESERVE_MAX_B (UINT64_C(256) * 1024 * 1024)
 #define NATIVE_CHUNK_ALIGN_B (UINT64_C(64) * 1024)
 #define NATIVE_CHUNK_KIND 6
 
@@ -82,33 +86,49 @@ native_chunk_strand(struct nvkmd_nvgpu_native_device_owner *owner,
    native_chunk_set_aside(owner, chunk, chunk_va);
 }
 
-/* A chunk from the pool, or a new registered chunk. Call with the owner
- * lock held. */
-
-static struct nvkmd_nvgpu_native_chunk *
-native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner)
+/* The start of the chunk's memory in its heap block. */
+static uintptr_t
+native_chunk_cpu(const struct nvkmd_nvgpu_native_chunk *chunk)
 {
-   struct nvkmd_nvgpu_native_chunk *chunk = owner->free_chunks;
-   if (chunk) {
-      owner->free_chunks = chunk->next;
-      owner->free_chunk_count--;
-      chunk->next = NULL;
-      return chunk;
-   }
-   chunk = calloc(1, sizeof(*chunk));
+   return align64((uintptr_t)chunk->allocation, NATIVE_CHUNK_ALIGN_B);
+}
+
+/* A chunk record with its heap block, not registered yet. NULL when there
+ * is no memory. Needs no lock. */
+static struct nvkmd_nvgpu_native_chunk *
+native_chunk_allocate(void)
+{
+   struct nvkmd_nvgpu_native_chunk *chunk = calloc(1, sizeof(*chunk));
    if (!chunk)
       return NULL;
+   const uint64_t heap_start = armGetSystemTick();
    chunk->allocation = malloc(NVKMD_NVGPU_NATIVE_CHUNK_B + NATIVE_CHUNK_ALIGN_B);
+   ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_HEAP,
+                          armGetSystemTick() - heap_start);
    if (!chunk->allocation) {
       free(chunk);
       return NULL;
    }
-   const uintptr_t cpu = align64((uintptr_t)chunk->allocation,
-                                 NATIVE_CHUNK_ALIGN_B);
+   return chunk;
+}
+
+/* Registers an allocated chunk. With cleared, the caller has cleared its
+ * memory. Returns false when the registration failed: the chunk is then
+ * freed, or stranded when a part of the registration remains. Call with
+ * the owner lock held. */
+static bool
+native_chunk_register(struct nvkmd_nvgpu_native_device_owner *owner,
+                      struct nvkmd_nvgpu_native_chunk *chunk, bool cleared)
+{
+   const uintptr_t cpu = native_chunk_cpu(chunk);
    /* Mode 2 (CPU uncached), as for the GPU-only segments. */
-   if (nvkmd_nvgpu_native_backing_prepare(&chunk->backing, owner->runtime,
-                                          cpu, NVKMD_NVGPU_NATIVE_CHUNK_B,
-                                          false) != NVKMD_NVGPU_BACKING_OK) {
+   const enum nvkmd_nvgpu_native_backing_status status = cleared ?
+      nvkmd_nvgpu_native_backing_prepare_cleared(
+         &chunk->backing, owner->runtime, cpu, NVKMD_NVGPU_NATIVE_CHUNK_B) :
+      nvkmd_nvgpu_native_backing_prepare(
+         &chunk->backing, owner->runtime, cpu, NVKMD_NVGPU_NATIVE_CHUNK_B,
+         false);
+   if (status != NVKMD_NVGPU_BACKING_OK) {
       if (nvkmd_nvgpu_native_backing_held(&chunk->backing)) {
          /* Part of the registration remains (a prepared span, a registered
           * range): the chunk keeps it, and device close releases it. */
@@ -121,9 +141,29 @@ native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner)
          free(chunk->allocation);
          free(chunk);
       }
-      return NULL;
+      return false;
    }
    owner->stats.chunks_registered++;
+   return true;
+}
+
+/* A chunk from the pool, or a new registered chunk (*created is then
+ * incremented). Call with the owner lock held. */
+static struct nvkmd_nvgpu_native_chunk *
+native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner,
+                  uint32_t *created)
+{
+   struct nvkmd_nvgpu_native_chunk *chunk = owner->free_chunks;
+   if (chunk) {
+      owner->free_chunks = chunk->next;
+      owner->free_chunk_count--;
+      chunk->next = NULL;
+      return chunk;
+   }
+   chunk = native_chunk_allocate();
+   if (!chunk || !native_chunk_register(owner, chunk, false))
+      return NULL;
+   (*created)++;
    return chunk;
 }
 
@@ -248,13 +288,19 @@ native_chunked_mem_retire(struct nvkmd_nvgpu_native_chunked_mem *mem)
    list_del(&mem->link);
 }
 
-/* Returns pool chunks beyond NATIVE_CHUNK_POOL_B to the process heap. */
+/* Returns pool chunks to the process heap: those beyond NATIVE_CHUNK_POOL_B
+ * above the reserve. The reserve fills the pool after an allocation, and
+ * the free that often follows (a program that replaces a buffer with a
+ * larger one) adds its chunks on top. With a limit at the reserve, each
+ * such free released the chunks that the reserve had just registered:
+ * 197 of 246 in one game session. */
 static void
 native_chunk_pool_trim(struct nvkmd_nvgpu_native_device_owner *owner,
                        struct nvkmd_dev *dev)
 {
    const uint32_t keep =
-      (uint32_t)(NATIVE_CHUNK_POOL_B / NVKMD_NVGPU_NATIVE_CHUNK_B);
+      (uint32_t)(NATIVE_CHUNK_POOL_B / NVKMD_NVGPU_NATIVE_CHUNK_B) +
+      owner->chunk_reserve_target;
    if (owner->free_chunk_count <= keep)
       return;
    /* The GPU L2 can hold lines of these chunks: complete earlier work and
@@ -314,6 +360,65 @@ static const struct nvkmd_mem_ops native_chunked_mem_ops = {
    .unmap = native_chunked_mem_unmap,
 };
 
+/* After an allocation of count chunks, of which created were registered
+ * during the call: the reserve keeps as many chunks ready as the largest
+ * allocation that had to register one, and fills up again. */
+static void
+native_chunk_reserve_note(struct nvkmd_nvgpu_native_device_owner *owner,
+                          uint32_t count, uint32_t created)
+{
+   const uint32_t most =
+      (uint32_t)(NATIVE_CHUNK_RESERVE_MAX_B / NVKMD_NVGPU_NATIVE_CHUNK_B);
+   if (created)
+      owner->chunk_reserve_target =
+         MAX2(owner->chunk_reserve_target, MIN2(count, most));
+   if (owner->free_chunk_count < owner->chunk_reserve_target)
+      nvkmd_nvgpu_native_chunk_reserve_wake();
+}
+
+uint32_t
+nvkmd_nvgpu_native_chunk_reserve_missing(
+   const struct nvkmd_nvgpu_native_device_owner *owner)
+{
+   if (!owner->chunked_ready || owner->submission_failed || owner->retiring ||
+       owner->free_chunk_count >= owner->chunk_reserve_target)
+      return 0;
+   return owner->chunk_reserve_target - owner->free_chunk_count;
+}
+
+struct nvkmd_nvgpu_native_chunk *
+nvkmd_nvgpu_native_chunk_reserve_prepare(void)
+{
+   struct nvkmd_nvgpu_native_chunk *chunk = native_chunk_allocate();
+   if (!chunk)
+      return NULL;
+   const uint64_t clear_start = armGetSystemTick();
+   memset((void *)native_chunk_cpu(chunk), 0, NVKMD_NVGPU_NATIVE_CHUNK_B);
+   ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_CLEAR,
+                          armGetSystemTick() - clear_start);
+   return chunk;
+}
+
+void
+nvkmd_nvgpu_native_chunk_reserve_discard(
+   struct nvkmd_nvgpu_native_chunk *chunk)
+{
+   free(chunk->allocation);
+   free(chunk);
+}
+
+bool
+nvkmd_nvgpu_native_chunk_reserve_add(
+   struct nvkmd_nvgpu_native_device_owner *owner,
+   struct nvkmd_nvgpu_native_chunk *chunk)
+{
+   if (!native_chunk_register(owner, chunk, true))
+      return false;
+   owner->stats.chunks_prepared++;
+   native_chunk_give_back(owner, chunk);
+   return true;
+}
+
 VkResult
 nvkmd_nvgpu_native_chunked_mem_create(
    struct nvkmd_dev *dev, struct nvkmd_nvgpu_native_device_owner *owner,
@@ -349,9 +454,10 @@ nvkmd_nvgpu_native_chunked_mem_create(
       owner, length_B, MAX2(align_B, NATIVE_CHUNK_ALIGN_B));
    hold->addr = va;
    VkResult result = va ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   uint32_t mapped = 0;
+   uint32_t mapped = 0, created = 0;
    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) {
-      struct nvkmd_nvgpu_native_chunk *chunk = native_chunk_take(owner);
+      struct nvkmd_nvgpu_native_chunk *chunk =
+         native_chunk_take(owner, &created);
       if (!chunk) {
          result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
          break;
@@ -398,6 +504,7 @@ nvkmd_nvgpu_native_chunked_mem_create(
    mem->va_hold = hold;
    list_addtail(&mem->link, &owner->chunked_mems);
    owner->stats.chunked_mems++;
+   native_chunk_reserve_note(owner, count, created);
    nvkmd_nvgpu_native_owner_unlock(owner);
 
    nvkmd_mem_init(dev, &mem->base, &native_chunked_mem_ops,

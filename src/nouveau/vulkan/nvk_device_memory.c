@@ -18,6 +18,9 @@
 #include <sys/mman.h> /* absent on Horizon */
 #endif
 
+#include "util/os_time.h"
+#include <ouncevk/profile.h>
+
 /* Supports opaque fd only */
 const VkExternalMemoryProperties nvk_opaque_fd_mem_props = {
    .externalMemoryFeatures =
@@ -178,11 +181,11 @@ enum nvk_memory_init {
    NVK_MEMORY_INIT_TRASH,
 };
 
-VKAPI_ATTR VkResult VKAPI_CALL
-nvk_AllocateMemory(VkDevice device,
-                   const VkMemoryAllocateInfo *pAllocateInfo,
-                   const VkAllocationCallbacks *pAllocator,
-                   VkDeviceMemory *pMem)
+static VkResult
+nvk_allocate_memory(VkDevice device,
+                    const VkMemoryAllocateInfo *pAllocateInfo,
+                    const VkAllocationCallbacks *pAllocator,
+                    VkDeviceMemory *pMem)
 {
    VK_FROM_HANDLE(nvk_device, dev, device);
    struct nvk_physical_device *pdev = nvk_device_physical_mut(dev);
@@ -412,6 +415,21 @@ fail_mem:
    nvkmd_mem_unref(mem->mem);
 fail_alloc:
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+   return result;
+}
+
+/* The allocation, timed for the profile. */
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_AllocateMemory(VkDevice device,
+                   const VkMemoryAllocateInfo *pAllocateInfo,
+                   const VkAllocationCallbacks *pAllocator,
+                   VkDeviceMemory *pMem)
+{
+   const uint64_t start = os_time_get_nano();
+   const VkResult result =
+      nvk_allocate_memory(device, pAllocateInfo, pAllocator, pMem);
+   ouncevk_profile_record_ns(OUNCEVK_PROFILE_ALLOCATE,
+                             os_time_get_nano() - start);
    return result;
 }
 

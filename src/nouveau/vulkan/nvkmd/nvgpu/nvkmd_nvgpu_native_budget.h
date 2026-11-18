@@ -50,8 +50,12 @@
  * 7.4 GiB of an 8.96 GiB heap. Dedicated segment lengths are rounded to the
  * placement alignment. */
 #define NVKMD_NVGPU_NATIVE_SEGMENT_ALIGN_B (UINT64_C(2) * 1024 * 1024)
-/* Empty segments are kept for reuse until they hold this many bytes. Above
- * this limit, the next growth releases them first. */
+/* Empty segments are kept for reuse, up to this many bytes for each kind
+ * of segment. Each kind has its own limit, so that the empty segments of
+ * one kind do not push out those of another: a program that allocates and
+ * frees one kind repeatedly would otherwise create a segment each time
+ * (1.7 ms for 16 MiB on the console). When a kind passes its limit, the
+ * segments that have been empty longest are released first. */
 #define NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B (UINT64_C(64) * 1024 * 1024)
 /* GPU VA lease: the primary segment is at its start. After it is a VA heap
  * for the map and kind-alias map of every other segment. The service

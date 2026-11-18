@@ -68,6 +68,8 @@ struct nvkmd_nvgpu_native_submit_stats {
    /* Chunked memory: chunks registered and released, failures, chunked memory. */
    uint32_t chunks_registered, chunks_released, chunk_failures;
    uint32_t chunked_mems;
+   /* Of chunks_registered: those that the reserve registered ahead. */
+   uint32_t chunks_prepared;
    /* Imported host pointers (nvkmd_nvgpu_native_host_mem.c), and failed
     * imports or releases. */
    uint32_t host_imports, host_import_failures;
@@ -128,6 +130,9 @@ struct nvkmd_nvgpu_native_segment {
     * such a submission. */
    bool release_pending;
    uint64_t release_flush;
+   /* When the segment last became empty, in the owner's emptied_serial
+    * order: the cache releases the smallest first. */
+   uint64_t emptied_serial;
    /* The CPU memory, from malloc. */
    void *cpu_allocation;
    uint64_t length_B, va_align_B;
@@ -190,6 +195,9 @@ struct nvkmd_nvgpu_native_device_owner {
    /* Segments waiting for a flushing submission (release_pending without
     * release_flush), and the serial of the last flushing submission. */
    uint32_t releases_waiting;
+   /* Counts the times a segment became empty (see the segment's
+    * emptied_serial). */
+   uint64_t emptied_serial;
    /* The context whose batch last ran with its own 3D and compute state on
     * the primary channel. Every VkDevice of the process shares that one
     * channel, and NVK sets the channel state once per queue. A batch of
@@ -204,6 +212,10 @@ struct nvkmd_nvgpu_native_device_owner {
     * lock. */
    struct nvkmd_nvgpu_native_chunk *free_chunks;
    uint32_t free_chunk_count;
+   /* The number of free chunks that the reserve keeps ready
+    * (nvkmd_nvgpu_native_chunk_reserve.h). 0 until an allocation had to
+    * register a chunk. */
+   uint32_t chunk_reserve_target;
    struct list_head chunked_mems;
    bool chunked_ready;
    /* Chunks that are out of the pool: a view still maps the chunk, or a
@@ -222,6 +234,9 @@ struct nvkmd_nvgpu_native_device_owner {
    /* Profiling: latency histograms, and the totals at the last profile
     * reset. Used under the owner lock. */
    struct ouncevk_profile_timer_stats profile_timers[OUNCEVK_PROFILE_TIMER_COUNT];
+   /* The same timers since the profile log's last line
+    * (nvkmd_nvgpu_native_profile_log.c). */
+   struct ouncevk_profile_timer_stats log_timers[OUNCEVK_PROFILE_TIMER_COUNT];
    uint64_t profile_base_execs, profile_base_exec_bytes, profile_base_flushes;
    uint64_t profile_base_signals, profile_base_syncs;
    /* GPU-only and HOST_CACHED memory come from segments of their own kind. */
@@ -426,9 +441,10 @@ nvkmd_nvgpu_native_segment_dedicated(uint64_t size_B)
  * its arena. The segment is pooled, or dedicated with size size_B (see
  * nvkmd_nvgpu_native_segment_dedicated). Returns NULL when the heap, the VA
  * heap or the segment table is exhausted, or when a service step failed.
- * Empty segments are released first in two cases: when they exceed
- * NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B, or when creation fails for lack of
- * room. That release runs on the thread of the owner, with dev. The caller
+ * Empty segments are released in two cases: when those of one kind exceed
+ * NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B (see
+ * nvkmd_nvgpu_native_owner_segment_emptied), or when creation fails for
+ * lack of room. That release runs on the thread of the owner, with dev. The caller
  * holds the owner lock (game role only). */
 struct nvkmd_dev;
 struct vk_object_base;
@@ -439,12 +455,14 @@ struct nvkmd_nvgpu_native_arena *nvkmd_nvgpu_native_owner_grow(
    struct nvkmd_dev *dev, struct vk_object_base *log_obj);
 
 /* Call after an allocation in arena is freed or unpinned. The segment may
- * now be empty while the cached empty segments already reach
- * NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B. In that case, this marks the segment
- * for release, and it takes no more allocations. Any thread can call it. It
- * takes the owner lock. The release waits for the next submission, which
- * then carries the ordered dirty-L2 flush. The release occurs when that
- * submission retires.
+ * now be empty, and the empty segments of its kind may then pass
+ * NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B. In that case, this marks the ones
+ * that have been empty longest for release, until the rest fit; they take
+ * no more allocations. This segment, the most recently emptied, is marked
+ * last: only when it is larger than the limit by itself. Any thread can
+ * call it. It takes the owner lock. The release waits for the next
+ * submission, which then carries the ordered dirty-L2 flush. The release
+ * occurs when that submission retires.
  */
 void nvkmd_nvgpu_native_owner_segment_emptied(
    struct nvkmd_nvgpu_native_device_owner *owner,

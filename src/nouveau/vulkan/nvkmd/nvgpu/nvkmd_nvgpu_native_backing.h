@@ -69,6 +69,15 @@ enum nvkmd_nvgpu_native_backing_status nvkmd_nvgpu_native_backing_prepare(
    struct nvkmd_nvgpu_native_runtime *runtime,
    uint64_t cpu_base, uint64_t length, bool cpu_cached);
 
+/* The same for mode 2, without the zeroing: the caller has cleared the
+ * whole span, and nothing wrote to it since. A caller can thus clear the
+ * memory before it takes the owner lock for the registration. */
+enum nvkmd_nvgpu_native_backing_status
+nvkmd_nvgpu_native_backing_prepare_cleared(
+   struct nvkmd_nvgpu_native_backing *backing,
+   struct nvkmd_nvgpu_native_runtime *runtime,
+   uint64_t cpu_base, uint64_t length);
+
 /* Registers a span of memory that the program owns, for an imported host
  * pointer (VK_EXT_external_memory_host). As mode 1, but the span keeps its
  * contents, and besides heap it can be memory of another state that may

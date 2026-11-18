@@ -54,6 +54,31 @@ uint32_t nvkmd_nvgpu_native_chunked_mem_parts(
    const struct nvkmd_mem *mem, uint64_t offset_B, uint64_t size_B,
    struct nvkmd_nvgpu_native_view_part *parts, uint32_t max);
 
+/* The steps of the chunk reserve (nvkmd_nvgpu_native_chunk_reserve.h),
+ * which registers free chunks ahead of the allocations that need them. */
+
+/* The number of chunks that the reserve lacks, or 0 when it is full or the
+ * device can take no more. Call with the owner lock held. */
+uint32_t nvkmd_nvgpu_native_chunk_reserve_missing(
+   const struct nvkmd_nvgpu_native_device_owner *owner);
+
+/* A chunk with cleared memory from the heap, not registered yet. NULL when
+ * there is no memory. Needs no lock: the clearing is the long step, and it
+ * does not hold up the other threads. */
+struct nvkmd_nvgpu_native_chunk *
+nvkmd_nvgpu_native_chunk_reserve_prepare(void);
+
+/* Registers a prepared chunk and puts it in the pool. Returns false when
+ * the registration failed; the chunk is then gone (freed, or set aside for
+ * device close). Call with the owner lock held. */
+bool nvkmd_nvgpu_native_chunk_reserve_add(
+   struct nvkmd_nvgpu_native_device_owner *owner,
+   struct nvkmd_nvgpu_native_chunk *chunk);
+
+/* Frees a prepared chunk that was not added. */
+void nvkmd_nvgpu_native_chunk_reserve_discard(
+   struct nvkmd_nvgpu_native_chunk *chunk);
+
 /* Returns to the pool every set-aside chunk that only waited for its
  * views: nothing maps it any more, and it did not fail. Call with the owner
  * lock held, after a view is unmapped. */

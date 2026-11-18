@@ -8,6 +8,7 @@
 #include "nvkmd_nvgpu_native_map.h"
 
 #include "util/log.h"
+#include <ouncevk/profile.h>
 #include "util/simple_mtx.h"
 
 #include <inttypes.h>
@@ -193,12 +194,13 @@ nvkmd_nvgpu_native_backing_restore_abandoned(uint32_t *failed)
 
 /* Registers a span. An imported span is not ours: it keeps its contents
  * and must be mode 1, because only the owner of the memory could change
- * its CPU attribute. */
+ * its CPU attribute. A span of ours is cleared here, unless the caller
+ * cleared it already (cleared). */
 static enum nvkmd_nvgpu_native_backing_status
 backing_register(struct nvkmd_nvgpu_native_backing *backing,
                  struct nvkmd_nvgpu_native_runtime *runtime,
                  uint64_t cpu_base, uint64_t length, bool cpu_cached,
-                 bool imported)
+                 bool imported, bool cleared)
 {
    if (!backing || !runtime || !cpu_base || !length ||
        (cpu_base & (BACKING_PAGE_B - 1)) || (length & (BACKING_PAGE_B - 1)) ||
@@ -224,21 +226,31 @@ backing_register(struct nvkmd_nvgpu_native_backing *backing,
                 : !heap_span(&info, cpu_base, length))
       return NVKMD_NVGPU_BACKING_PROFILE;
 
-   if (!imported)
+   uint64_t step_start = armGetSystemTick();
+   if (!imported && !cleared)
       memset((void *)(uintptr_t)cpu_base, 0, length);
    /* Mode 1 keeps the CPU caches on. Write the contents back to memory
     * before the GPU can see the span. */
    if (cpu_cached)
       nvkmd_nvgpu_native_dcache_clean_invalidate(cpu_base, length);
+   if (!cleared)
+      ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_CLEAR,
+                             armGetSystemTick() - step_start);
+   step_start = armGetSystemTick();
    Result rc = svcUnknown80((void *)(uintptr_t)cpu_base, length,
                             BACKING_PREPARE_BIT, BACKING_PREPARE_BIT);
+   ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_MARK,
+                          armGetSystemTick() - step_start);
    if (R_FAILED(rc))
       return fail(backing, NVKMD_NVGPU_BACKING_PREPARE, rc);
    backing->prepared = true;
    record_span(cpu_base, length);
 
+   const uint64_t sent_at = armGetSystemTick();
    rc = gsvGpuRegisterMemory(&runtime->gpu, cpu_base, length,
                              runtime->vm.client, &backing->range_id);
+   ouncevk_profile_record(OUNCEVK_PROFILE_SERVICE_REGISTER,
+                          armGetSystemTick() - sent_at);
    if (R_FAILED(rc) || !backing->range_id) {
       /* The service refused the span. Clear the SVC 0x80 bit again, so
        * the program gets its memory back as it came. */
@@ -269,9 +281,12 @@ backing_register(struct nvkmd_nvgpu_native_backing *backing,
       return NVKMD_NVGPU_BACKING_OK;
    }
    if (info.attr != BACKING_UNCACHED_ATTRIBUTE) {
+      step_start = armGetSystemTick();
       rc = svcSetMemoryAttribute((void *)(uintptr_t)cpu_base, length,
                                  BACKING_UNCACHED_ATTRIBUTE,
                                  BACKING_UNCACHED_ATTRIBUTE);
+      ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_UNCACHE,
+                             armGetSystemTick() - step_start);
       if (R_FAILED(rc))
          return fail(backing, NVKMD_NVGPU_BACKING_SET_ATTRIBUTES, rc);
    }
@@ -295,7 +310,17 @@ nvkmd_nvgpu_native_backing_prepare(
    uint64_t cpu_base, uint64_t length, bool cpu_cached)
 {
    return backing_register(backing, runtime, cpu_base, length, cpu_cached,
-                           false);
+                           false, false);
+}
+
+enum nvkmd_nvgpu_native_backing_status
+nvkmd_nvgpu_native_backing_prepare_cleared(
+   struct nvkmd_nvgpu_native_backing *backing,
+   struct nvkmd_nvgpu_native_runtime *runtime,
+   uint64_t cpu_base, uint64_t length)
+{
+   return backing_register(backing, runtime, cpu_base, length, false, false,
+                           true);
 }
 
 enum nvkmd_nvgpu_native_backing_status
@@ -304,7 +329,8 @@ nvkmd_nvgpu_native_backing_import(
    struct nvkmd_nvgpu_native_runtime *runtime,
    uint64_t cpu_base, uint64_t length)
 {
-   return backing_register(backing, runtime, cpu_base, length, true, true);
+   return backing_register(backing, runtime, cpu_base, length, true, true,
+                           false);
 }
 
 enum nvkmd_nvgpu_native_backing_status
@@ -338,6 +364,7 @@ nvkmd_nvgpu_native_backing_release(
    if (backing->registered && !nvkmd_nvgpu_native_slot_settle(slot, &rc))
       return fail(backing, NVKMD_NVGPU_BACKING_SLOT, rc);
    if (backing->registered) {
+      const uint64_t sent_at = armGetSystemTick();
       rc = gsvGpuUnregisterMemory(&runtime->gpu, backing->range_id,
                                   slot->index);
       const struct nvkmd_nvgpu_native_slot_pending request = {
@@ -345,7 +372,7 @@ nvkmd_nvgpu_native_backing_release(
          .backing = backing,
       };
       const enum nvkmd_nvgpu_native_slot_outcome outcome =
-         nvkmd_nvgpu_native_slot_finish(slot, rc, &request, &rc);
+         nvkmd_nvgpu_native_slot_finish(slot, sent_at, rc, &request, &rc);
       /* Refused: the range is still registered. */
       if (outcome == NVKMD_NVGPU_NATIVE_SLOT_REFUSED)
          return fail(backing, NVKMD_NVGPU_BACKING_UNREGISTER, rc);

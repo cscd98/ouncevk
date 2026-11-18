@@ -431,17 +431,42 @@ native_owner_reclaim(struct nvkmd_nvgpu_native_device_owner *owner,
    return released;
 }
 
-/* Bytes in empty segments kept for reuse (not marked for release). */
+/* True for an empty segment that is kept for reuse (not marked for
+ * release). */
+static bool
+native_segment_cached(const struct nvkmd_nvgpu_native_segment *segment)
+{
+   return native_segment_empty(segment) && !segment->release_pending &&
+          !segment->arena.retiring;
+}
+
+/* Bytes in the cached segments of one kind. */
 static uint64_t
-native_owner_cached_bytes(const struct nvkmd_nvgpu_native_device_owner *owner)
+native_owner_cached_bytes(const struct nvkmd_nvgpu_native_device_owner *owner,
+                          enum nvkmd_nvgpu_native_segment_kind kind)
 {
    uint64_t bytes = 0;
    for (uint32_t i = 0; i < owner->segment_count; i++) {
       const struct nvkmd_nvgpu_native_segment *segment = &owner->segments[i];
-      if (native_segment_empty(segment) && !segment->release_pending)
+      if (segment->kind == kind && native_segment_cached(segment))
          bytes += segment->length_B;
    }
    return bytes;
+}
+
+/* The cached segment of one kind that has been empty longest, or NULL. */
+static struct nvkmd_nvgpu_native_segment *
+native_owner_oldest_cached(struct nvkmd_nvgpu_native_device_owner *owner,
+                           enum nvkmd_nvgpu_native_segment_kind kind)
+{
+   struct nvkmd_nvgpu_native_segment *oldest = NULL;
+   for (uint32_t i = 0; i < owner->segment_count; i++) {
+      struct nvkmd_nvgpu_native_segment *segment = &owner->segments[i];
+      if (segment->kind == kind && native_segment_cached(segment) &&
+          (!oldest || segment->emptied_serial < oldest->emptied_serial))
+         oldest = segment;
+   }
+   return oldest;
 }
 
 void
@@ -456,22 +481,29 @@ nvkmd_nvgpu_native_owner_segment_emptied(
    for (uint32_t i = 0; i < owner->segment_count && !segment; i++)
       if (&owner->segments[i].arena == arena)
          segment = &owner->segments[i];
-   if (segment && native_segment_empty(segment) && !segment->release_pending &&
-       !segment->arena.retiring) {
-      /* The cache, without this segment, plus this segment. */
-      const uint64_t cached =
-         native_owner_cached_bytes(owner) - segment->length_B;
-      if (cached + segment->length_B > NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B) {
-         segment->release_pending = true;
-         segment->arena.retiring = true;
+   if (segment && native_segment_cached(segment)) {
+      /* This segment is now the most recently emptied of its kind, so it
+       * is the last that the loop below marks. */
+      segment->emptied_serial = ++owner->emptied_serial;
+      uint64_t cached = native_owner_cached_bytes(owner, segment->kind);
+      bool marked = false;
+      while (cached > NVKMD_NVGPU_NATIVE_SEGMENT_CACHE_B) {
+         struct nvkmd_nvgpu_native_segment *oldest =
+            native_owner_oldest_cached(owner, segment->kind);
+         if (!oldest)
+            break;
+         cached -= oldest->length_B;
+         oldest->release_pending = true;
+         oldest->arena.retiring = true;
          owner->releases_waiting++;
-         /* With no submission in flight, no later batch may come to carry
-          * the dirty flush (for example a program that only maps memory).
-          * Submit the finish flush now; its completion releases the
-          * segment. */
-         if (dev && owner->inflight_submissions == 0)
-            (void)native_owner_finish_flush(owner, dev, NULL);
+         marked = true;
       }
+      /* With no submission in flight, no later batch may come to carry
+       * the dirty flush (for example a program that only maps memory).
+       * Submit the finish flush now; its completion releases the marked
+       * segments. */
+      if (marked && dev && owner->inflight_submissions == 0)
+         (void)native_owner_finish_flush(owner, dev, NULL);
    }
    nvkmd_nvgpu_native_owner_unlock(owner);
 }
@@ -538,7 +570,10 @@ native_owner_take_room(struct nvkmd_nvgpu_native_device_owner *owner,
     * which libounce does not use. */
    if (length_B > SIZE_MAX - cpu_align_B)
       return NVKMD_NVGPU_SEGMENT_FAILURE_HEAP;
+   const uint64_t heap_start = armGetSystemTick();
    void *allocation = malloc(length_B + cpu_align_B);
+   ouncevk_profile_record(OUNCEVK_PROFILE_BACKING_HEAP,
+                          armGetSystemTick() - heap_start);
    if (!allocation)
       return NVKMD_NVGPU_SEGMENT_FAILURE_HEAP;
    void *cpu = (void *)(uintptr_t)align64((uintptr_t)allocation, cpu_align_B);

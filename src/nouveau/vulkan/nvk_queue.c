@@ -11,6 +11,9 @@
 #include "nvk_physical_device.h"
 #include "nv_push.h"
 
+#include "util/os_time.h"
+#include <ouncevk/profile.h>
+
 #include "nv_push_cl9039.h"
 #include "nv_push_cl9097.h"
 #include "nv_push_cl90b5.h"
@@ -338,8 +341,8 @@ fail:
 }
 
 static VkResult
-nvk_queue_submit(struct vk_queue *vk_queue,
-                 struct vk_queue_submit *submit)
+nvk_queue_submit_work(struct vk_queue *vk_queue,
+                      struct vk_queue_submit *submit)
 {
    struct nvk_queue *queue = container_of(vk_queue, struct nvk_queue, vk);
    VkResult result;
@@ -361,6 +364,18 @@ nvk_queue_submit(struct vk_queue *vk_queue,
    }
 
    return VK_SUCCESS;
+}
+
+/* The driver's work for one submission, for the profile. */
+static VkResult
+nvk_queue_submit(struct vk_queue *vk_queue,
+                 struct vk_queue_submit *submit)
+{
+   const uint64_t start = os_time_get_nano();
+   const VkResult result = nvk_queue_submit_work(vk_queue, submit);
+   ouncevk_profile_record_ns(OUNCEVK_PROFILE_SUBMIT,
+                             os_time_get_nano() - start);
+   return result;
 }
 
 static VkResult
