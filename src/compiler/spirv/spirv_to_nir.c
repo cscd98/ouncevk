@@ -1178,6 +1178,10 @@ vtn_handle_decoration(struct vtn_builder *b, SpvOp opcode,
       dec->num_operands = w_end - w;
       dec->operands = w;
 
+      if (dec->scope != VTN_DEC_EXECUTION_MODE &&
+          dec->decoration == SpvDecorationInvariant)
+         b->has_invariant_output = true;
+
       /* Link into the list */
       dec->next = val->decoration;
       val->decoration = dec;

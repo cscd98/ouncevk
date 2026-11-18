@@ -257,6 +257,20 @@ impl DepGraph {
     }
 }
 
+/// The most dependencies that one scoreboard carries between two waits on
+/// it. A scoreboard is a counter of its outstanding instructions, six bits
+/// wide in the published descriptions (Huerta et al., "Analyzing Modern
+/// NVIDIA GPU Cores", arXiv:2503.20481, sections 4 and 7.5; NVIDIA's patent
+/// US9612836B2 gives the same width as an example), and what an increment
+/// of a full counter does is not known. With at most 63, the counter
+/// cannot be full however long the instructions take.
+///
+/// NVIDIA's compiler goes further: 67 global loads and 302 local stores on
+/// one scoreboard. Replayed on a clock, its loads stay within 63
+/// outstanding while a load takes fewer than 255 cycles, and a store's
+/// sources are read within about 20.
+const MAX_BAR_DEPS: usize = 63;
+
 /// Assigns the six scoreboards. A scoreboard counts its outstanding
 /// instructions, and a wait on it waits for all of them, so one scoreboard
 /// can carry several dependencies: waiting for any of them then waits for
@@ -307,6 +321,27 @@ impl BarAlloc {
             .filter(|&bar| Some(bar) != excluded)
             .max_by_key(|&bar| newest(bar))
             .unwrap()
+    }
+
+    fn bar_is_full(&self, bar: u8) -> bool {
+        self.bar_deps[usize::from(bar)].len() >= MAX_BAR_DEPS
+    }
+
+    /// Picks the scoreboard for a new dependency of an instruction whose
+    /// other dependency, if any, is on `excluded`. Returns the scoreboard
+    /// and whether the instruction must wait for it first: with no free
+    /// scoreboard and the youngest one full, the scoreboard is emptied by a
+    /// wait, as every scoreboard was before they were shared.
+    pub fn take_bar(&mut self, excluded: Option<u8>) -> (u8, bool) {
+        if let Some(bar) = self.try_find_free_bar() {
+            return (bar, false);
+        }
+        let bar = self.youngest_bar(excluded);
+        if !self.bar_is_full(bar) {
+            return (bar, false);
+        }
+        self.free_bar(bar);
+        (bar, true)
     }
 
     pub fn get_bar_for_dep(&self, dep: usize) -> Option<u8> {
@@ -733,17 +768,19 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
             let mut rd_bar = None;
             if deps.dep_is_waited_after(rd_dep, bi, ip) {
-                let bar = bars
-                    .try_find_free_bar()
-                    .unwrap_or_else(|| bars.youngest_bar(None));
+                let (bar, wait_first) = bars.take_bar(None);
+                if wait_first {
+                    instr.deps.add_wt_bar_mask(1 << bar);
+                }
                 bars.add_bar_dep(bar, rd_dep);
                 instr.deps.set_rd_bar(bar);
                 rd_bar = Some(bar);
             }
             if deps.dep_is_waited_after(wr_dep, bi, ip) {
-                let wr_bar = bars
-                    .try_find_free_bar()
-                    .unwrap_or_else(|| bars.youngest_bar(rd_bar));
+                let (wr_bar, wait_first) = bars.take_bar(rd_bar);
+                if wait_first {
+                    instr.deps.add_wt_bar_mask(1 << wr_bar);
+                }
                 bars.add_bar_dep(wr_bar, wr_dep);
                 instr.deps.set_wr_bar(wr_bar);
             }

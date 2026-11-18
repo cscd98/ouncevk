@@ -71,8 +71,8 @@ uint32_t nvkmd_nvgpu_native_chunk_reserve_missing(
    const struct nvkmd_nvgpu_native_device_owner *owner);
 
 /* A chunk with cleared memory from the heap, not registered yet. NULL when
- * there is no memory. Needs no lock: the clearing is the long step, and it
- * does not hold up the other threads. */
+ * there is no memory. Call without the owner lock: the clearing is the long
+ * step, and it must not hold up the other threads. */
 struct nvkmd_nvgpu_native_chunk *
 nvkmd_nvgpu_native_chunk_reserve_prepare(void);
 
@@ -92,6 +92,18 @@ void nvkmd_nvgpu_native_chunk_reserve_discard(
  * lock held, after a view is unmapped. */
 void nvkmd_nvgpu_native_owner_reclaim_chunks(
    struct nvkmd_nvgpu_native_device_owner *owner);
+
+/* When the process heap has no memory for the driver: returns every free
+ * chunk of both pools to the heap, after a finish flush, and returns their
+ * number. The reserve then waits for an allocation that registers a chunk
+ * before it fills the pool again. Call with the owner lock held; the lock
+ * is released during the wait for the flush. */
+uint32_t nvkmd_nvgpu_native_owner_release_free_chunks(
+   struct nvkmd_nvgpu_native_device_owner *owner, struct nvkmd_dev *dev);
+
+/* The bytes of free chunks in both pools. Call with the owner lock held. */
+uint64_t nvkmd_nvgpu_native_owner_free_chunk_bytes(
+   const struct nvkmd_nvgpu_native_device_owner *owner);
 
 /* At device close: unmaps the chunks of memory that the program did not
  * free and releases every chunk, the set-aside ones included. Returns false

@@ -189,11 +189,14 @@ profile_log_thread(void *argument)
                           (uint64_t)profile_log.interval_ms * 1000000u;
       deadline.tv_sec += (time_t)(ns / 1000000000u);
       deadline.tv_nsec = (long)(ns % 1000000000u);
-      while (!profile_log.stop &&
-             cnd_timedwait(&profile_log.stop_requested, &profile_log.mutex,
-                           &deadline) != thrd_timedout) {
-      }
-      if (profile_log.stop)
+      /* A wait that returns success was signalled or woke early. */
+      int waited = thrd_success;
+      while (!profile_log.stop && waited == thrd_success)
+         waited = cnd_timedwait(&profile_log.stop_requested,
+                                &profile_log.mutex, &deadline);
+      /* Without a working wait, the thread would write lines without
+       * pause. */
+      if (profile_log.stop || waited != thrd_timedout)
          break;
       mtx_unlock(&profile_log.mutex);
       struct profile_sample sample;

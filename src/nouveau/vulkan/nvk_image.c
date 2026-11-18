@@ -1096,6 +1096,13 @@ nvk_image_init(struct nvk_device *dev,
    /*
     * We don't know how to update the zcull data if the image is written
     * as anything other than a depth attachment
+    *
+    * The image has one ZCULL save area, and LOAD_ZCULL restores what the
+    * last render pass stored there. With several layers or mip levels, that
+    * can be the bounds of another subresource, which would reject fragments
+    * that this one's depth accepts. Such an image has no save area: ZCULL
+    * then works in the render passes that clear the depth
+    * (nvk_CmdBeginRendering).
     */
    const VkImageUsageFlagBits ZCULL_COMPATIBLE_IMAGE_USAGE =
       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | READ_ONLY_IMAGE_USAGE;
@@ -1105,6 +1112,8 @@ nvk_image_init(struct nvk_device *dev,
        !(image->vk.usage & ~ZCULL_COMPATIBLE_IMAGE_USAGE) &&
        !(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
        image->vk.image_type != VK_IMAGE_TYPE_3D &&
+       image->vk.array_layers == 1 &&
+       image->vk.mip_levels == 1 &&
        image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
        pdev->info.has_zcull_info) {
       image->zcull.nil = nil_zcull_new(&pdev->info.zcull_info, 0, 0,

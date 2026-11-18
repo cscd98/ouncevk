@@ -19,7 +19,7 @@
 #endif
 
 #include "util/os_time.h"
-#include <ouncevk/profile.h>
+#include "nvk_profile.h"
 
 /* Supports opaque fd only */
 const VkExternalMemoryProperties nvk_opaque_fd_mem_props = {
@@ -428,8 +428,8 @@ nvk_AllocateMemory(VkDevice device,
    const uint64_t start = os_time_get_nano();
    const VkResult result =
       nvk_allocate_memory(device, pAllocateInfo, pAllocator, pMem);
-   ouncevk_profile_record_ns(OUNCEVK_PROFILE_ALLOCATE,
-                             os_time_get_nano() - start);
+   nvk_profile_record_ns(OUNCEVK_PROFILE_ALLOCATE,
+                         os_time_get_nano() - start);
    return result;
 }
 

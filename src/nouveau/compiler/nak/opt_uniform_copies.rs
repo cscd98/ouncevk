@@ -23,8 +23,8 @@
 //!
 //! Legalize also copies a constant or uniform value into a warp register
 //! separately for each instruction that needs it there, such as the handle
-//! of every image load. A copy of the same value soon after an earlier one
-//! in the block reuses the earlier copy.
+//! of every image load. A copy of the same value a few instructions after
+//! the previous copy of it in the block reuses that copy.
 //!
 //! The pass runs on SSA after legalize, and legalize runs again after it,
 //! since an instruction moved to the warp datapath may need its own sources
@@ -156,13 +156,15 @@ fn constant_to_warp_copy(instr: &Instr) -> Option<(SSAValue, &Src)> {
 }
 
 impl Function {
-    /// Makes later copies of the same constant or uniform value in a block
-    /// use an earlier copy, within SHORT_EXTENSION instructions of its last
-    /// use.
+    /// Makes a copy of a constant or uniform value use the earlier copy of
+    /// the same value in its block, when the previous copy of that value
+    /// (kept or replaced) is at most SHORT_EXTENSION instructions before
+    /// it.
     fn reuse_constant_copies(&mut self) -> bool {
         let mut rename: FxHashMap<SSAValue, SSAValue> = Default::default();
         for block in &mut self.blocks.iter_mut() {
-            // Earlier copies: source, destination and last use position.
+            // Earlier copies: the source, the destination, and the
+            // position of the last copy of that source.
             let mut earlier: Vec<(Src, SSAValue, usize)> = Vec::new();
             let mut removed: Vec<usize> = Vec::new();
             for (ip, instr) in block.instrs.iter().enumerate() {

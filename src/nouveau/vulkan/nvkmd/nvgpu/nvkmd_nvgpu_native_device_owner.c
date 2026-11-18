@@ -30,7 +30,6 @@
  */
 #define ZCULL_BIND_IOCTL UINT32_C(0xc010480b)
 #define ZCULL_BIND_MODE_SEPARATE_BUFFER 2u
-#define ZCULL_CONTEXT_ALIGN_B UINT64_C(0x1000)
 
 /* Binds a ZCULL context-switch buffer to the graphics TSG, after the 3D
  * channel is configured and before its first commands. ZCULL is optional:
@@ -50,7 +49,7 @@ bind_zcull_context(struct nvkmd_nvgpu_native_device_owner *owner,
       return;
 
    if (nvkmd_nvgpu_native_arena_alloc(&owner->arena, zcull->context_size_B,
-                                      ZCULL_CONTEXT_ALIGN_B,
+                                      NVKMD_NVGPU_NATIVE_ZCULL_CONTEXT_ALIGN_B,
                                       &owner->zcull_context) !=
        NVKMD_NVGPU_NATIVE_ARENA_OK)
       return;
@@ -734,6 +733,12 @@ nvkmd_nvgpu_native_owner_grow(
                                     va_align_B, &segment, &allocation, &cpu,
                                     &va);
    }
+   /* The free chunks of GPU-only memory are heap memory too. */
+   if (room == NVKMD_NVGPU_SEGMENT_FAILURE_HEAP &&
+       nvkmd_nvgpu_native_owner_release_free_chunks(owner, dev))
+      room = native_owner_take_room(owner, length_B, cpu_align_B,
+                                    va_align_B, &segment, &allocation, &cpu,
+                                    &va);
    if (room != NVKMD_NVGPU_SEGMENT_FAILURE_NONE)
       return native_owner_grow_failed(owner, room, 0, length_B);
 

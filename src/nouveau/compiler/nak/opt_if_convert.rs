@@ -609,7 +609,9 @@ impl Function {
 
 impl Shader<'_> {
     pub fn opt_if_convert(&mut self) {
-        if self.sm.sm() < 70 {
+        // A predicated global load uses the load's own predicate source,
+        // which only the SM73 form of the instruction encodes.
+        if self.sm.sm() < 73 {
             return;
         }
         let exit_early = matches!(self.info.stage, ShaderStageInfo::Compute(_));

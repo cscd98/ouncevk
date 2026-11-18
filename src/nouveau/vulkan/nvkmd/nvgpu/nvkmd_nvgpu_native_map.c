@@ -15,8 +15,9 @@
 #define MAP_PAGE_B UINT64_C(0x1000)
 #define MAP_SLOT_LIMIT 32
 #define MAP_KIND_ORDINARY 6
-/* dev_mmu.h: NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE (8) to
- * NV_MMU_PTE_KIND_Z24S8_COMPRESSIBLE_DISABLE_PLC (0xe). */
+/* NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE (8) to
+ * NV_MMU_PTE_KIND_Z24S8_COMPRESSIBLE_DISABLE_PLC (0xe), in
+ * src/nouveau/headers/nvidia/hwref/turing/tu102/dev_mmu.h. */
 #define MAP_KIND_COMPRESSIBLE_FIRST 8
 #define MAP_KIND_COMPRESSIBLE_LAST 0xe
 /* One wait for a slot's completion. A wait that times out is repeated. */

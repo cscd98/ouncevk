@@ -56,6 +56,7 @@ nvk_files = files(
   'nvk_physical_device.c',
   'nvk_physical_device.h',
   'nvk_private.h',
+  'nvk_profile.h',
   'nvk_query_pool.c',
   'nvk_query_pool.h',
   'nvk_queue.c',

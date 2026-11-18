@@ -426,8 +426,6 @@ native_open(struct vk_object_base *log_obj)
 
 /* The most ZCULL subregions NIL handles (nil/zcull.rs MAX_SUBREGIONS). */
 #define NATIVE_ZCULL_MAX_SUBREGIONS 16
-/* The ZCULL context alignment. */
-#define NATIVE_ZCULL_CONTEXT_ALIGN_B 0x1000
 
 /* Publishes ZCULL in the device information when the context buffer is
  * bound. The geometry words come in wire order: the last three are the
@@ -441,7 +439,7 @@ native_publish_zcull(struct nv_device_info *info)
    const struct nvkmd_nvgpu_native_zcull_query *zcull =
       &native_runtime.delegate.zcull;
    if (!native_device.zcull_bound) {
-      mesa_logi("native ZCULL off: queried %d bound %d query 0x%x bind 0x%x",
+      mesa_logd("native ZCULL off: queried %d bound %d query 0x%x bind 0x%x",
                 zcull->queried, native_device.zcull_bound,
                 zcull->result, native_device.zcull_result);
       return;
@@ -460,7 +458,7 @@ native_publish_zcull(struct nv_device_info *info)
       .subregion_width_align_pixels = w[7],
       .subregion_height_align_pixels = w[8],
       .ctxsw_size = zcull->context_size_B,
-      .ctxsw_align = NATIVE_ZCULL_CONTEXT_ALIGN_B,
+      .ctxsw_align = NVKMD_NVGPU_NATIVE_ZCULL_CONTEXT_ALIGN_B,
    };
    mesa_logi("native ZCULL: align %ux%u squares/aliquot %u aliquots %u "
              "multiplier %u headers %u/%u subregions %u (%ux%u) context %u",

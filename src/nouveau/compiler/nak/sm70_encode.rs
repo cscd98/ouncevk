@@ -3245,6 +3245,8 @@ impl SM70Op for OpLd {
                     e.set_ureg_addr(32, &self.uniform_addr, 72);
                     e.set_rev_pred_src(64..67, 67, &self.pred);
                 } else {
+                    // This form has no predicate source.
+                    assert!(self.pred.is_true());
                     e.set_opcode(0x381);
                     e.set_reg_addr(24..32, &self.addr, 72);
                 }

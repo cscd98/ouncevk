@@ -13,12 +13,20 @@
  * when the pool holds more than the reserve plus 128 MiB.
  *
  * The thread adds no chunk while the process heap has less than
- * 512 MiB free.
+ * 512 MiB free, and a free then keeps 128 MiB of free chunks at most. When
+ * the heap has no memory for the driver, every free chunk returns to it
+ * and the reserve starts again from nothing.
  */
 #ifndef NVKMD_NVGPU_NATIVE_CHUNK_RESERVE_H
 #define NVKMD_NVGPU_NATIVE_CHUNK_RESERVE_H
 
+#include <stdbool.h>
+
 struct nvkmd_nvgpu_native_device_owner;
+
+/* Whether the process heap has enough free memory for the reserve to keep
+ * chunks ready. Needs no lock. */
+bool nvkmd_nvgpu_native_chunk_reserve_heap_allows(void);
 
 /* Starts the thread for the device. Call after the device opened. Does
  * nothing when the thread already runs. */

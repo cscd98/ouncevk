@@ -3640,10 +3640,12 @@ impl<'a> ShaderFromNir<'a> {
                 let within_workgroup =
                     within_subgroup || intrin.memory_scope() == SCOPE_WORKGROUP;
                 // L1 write-back and invalidation make global memory visible
-                // to other threads' loads. A subgroup needs neither (see
-                // below).
-                let needs_cache_ops =
-                    (modes & nir_var_mem_global) != 0 && !within_subgroup;
+                // to other threads' loads. A subgroup needs neither where
+                // its fence is free (see below).
+                let subgroup_fence_is_free =
+                    within_subgroup && self.sm.sm() >= 70;
+                let needs_cache_ops = (modes & nir_var_mem_global) != 0
+                    && !subgroup_fence_is_free;
                 if needs_cache_ops && (semantics & NIR_MEMORY_RELEASE) != 0 {
                     // Pre-Volta doesn't have WBAll but it also seems that we
                     // don't need it.
@@ -3687,8 +3689,8 @@ impl<'a> ShaderFromNir<'a> {
                 // subgroupMemoryBarrierBuffer(), subgroupBarrier() or
                 // barrier().
                 let shared_only = (intrin.memory_modes() & !nir_var_mem_shared) == 0;
-                let fence_is_free = self.sm.sm() >= 70
-                    && (within_subgroup || (shared_only && within_workgroup));
+                let fence_is_free = subgroup_fence_is_free
+                    || (self.sm.sm() >= 70 && shared_only && within_workgroup);
                 let needs_membar =
                     intrin.memory_scope() != SCOPE_NONE && !fence_is_free;
                 if needs_membar {

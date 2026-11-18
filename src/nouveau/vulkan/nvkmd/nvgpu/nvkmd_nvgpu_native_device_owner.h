@@ -175,6 +175,10 @@ struct nvkmd_nvgpu_native_copy_channel {
  * lease, a notifier page and one configured channel. It uses the services
  * of the runtime. Its children must keep these addresses unchanged. The
  * channel setup keeps a pointer to its record. */
+/* The alignment of the ZCULL context-switch buffer.
+ */
+#define NVKMD_NVGPU_NATIVE_ZCULL_CONTEXT_ALIGN_B UINT64_C(0x1000)
+
 struct nvkmd_nvgpu_native_device_owner {
    const struct nvkmd_nvgpu_native_device_owner *self;
    struct nvkmd_nvgpu_native_runtime *runtime;

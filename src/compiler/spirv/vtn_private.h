@@ -661,6 +661,10 @@ struct vtn_builder {
     * use. See vtn_handle_alu.
     */
    uint32_t *matrix_product_operands;
+   /* The module decorates a variable or a block member Invariant. Its
+    * decorations precede every function body.
+    */
+   bool has_invariant_output;
    struct vtn_value *values;
 
    /* Information on the origin of the SPIR-V */

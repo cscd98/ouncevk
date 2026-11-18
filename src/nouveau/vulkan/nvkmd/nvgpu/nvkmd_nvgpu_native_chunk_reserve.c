@@ -21,9 +21,10 @@ static struct {
    mtx_t mutex;
    cnd_t changed;
    thrd_t thread;
-   /* running: the thread exists. stop: it must end. pending: the pool was
-    * reported below the reserve. */
-   bool running, stop, pending;
+   /* running: the thread exists. stop: it must end. joining: a caller of
+    * the stop waits for its end. pending: the pool was reported below the
+    * reserve. */
+   bool running, stop, joining, pending;
 } reserve;
 
 static once_flag reserve_once = ONCE_FLAG_INIT;
@@ -52,8 +53,8 @@ reserve_stopping(void)
    return stop;
 }
 
-static bool
-reserve_heap_allows(void)
+bool
+nvkmd_nvgpu_native_chunk_reserve_heap_allows(void)
 {
    uint64_t available_B = 0;
    nvkmd_nvgpu_native_heap_query(NULL, &available_B);
@@ -77,7 +78,7 @@ static void
 reserve_fill(struct nvkmd_nvgpu_native_device_owner *owner)
 {
    while (!reserve_stopping() && reserve_missing(owner) &&
-          reserve_heap_allows()) {
+          nvkmd_nvgpu_native_chunk_reserve_heap_allows()) {
       struct nvkmd_nvgpu_native_chunk *chunk =
          nvkmd_nvgpu_native_chunk_reserve_prepare();
       if (!chunk)
@@ -146,17 +147,20 @@ nvkmd_nvgpu_native_chunk_reserve_stop(void)
    if (!reserve_usable)
       return;
    mtx_lock(&reserve.mutex);
-   const bool running = reserve.running;
-   if (running) {
+   /* Only one caller joins the thread. */
+   const bool join = reserve.running && !reserve.joining;
+   if (join) {
+      reserve.joining = true;
       reserve.stop = true;
       cnd_signal(&reserve.changed);
    }
    mtx_unlock(&reserve.mutex);
-   if (!running)
+   if (!join)
       return;
    thrd_join(reserve.thread, NULL);
    mtx_lock(&reserve.mutex);
    reserve.running = false;
+   reserve.joining = false;
    mtx_unlock(&reserve.mutex);
 }
 

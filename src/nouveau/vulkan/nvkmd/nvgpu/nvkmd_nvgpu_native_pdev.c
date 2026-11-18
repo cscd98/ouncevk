@@ -794,8 +794,8 @@ native_arena_unused_bytes(const struct nvkmd_nvgpu_native_arena *arena)
    return live < arena->length ? arena->length - live : 0;
 }
 
-/* Game role: further allocations can use the free bytes of the heap and the
- * empty space in segments. */
+/* Game role: further allocations can use the free bytes of the heap, the
+ * empty space in segments and the free chunks of GPU-only memory. */
 static uint64_t
 native_pdev_sysmem_available(struct nvkmd_pdev *base)
 {
@@ -812,6 +812,7 @@ native_pdev_sysmem_available(struct nvkmd_pdev *base)
    for (uint32_t i = 0; i < owner->segment_count; i++)
       if (owner->segments[i].ready)
          available += native_arena_unused_bytes(&owner->segments[i].arena);
+   available += nvkmd_nvgpu_native_owner_free_chunk_bytes(owner);
    nvkmd_nvgpu_native_owner_unlock(owner);
    return MIN2(available, base->bounded_sysmem_size_B);
 }

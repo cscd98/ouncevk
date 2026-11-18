@@ -828,9 +828,18 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
        (num_inputs >= 2 && glsl_type_is_matrix(vtn_src[1]->type))) {
       /* Matrix products may be reassociated unless the result is exact
        * (NoContraction) or computed at reduced precision.
+       *
+       * A module with an invariant output keeps the products as written.
+       * The reassociation depends on how the SPIR-V names the product: it
+       * does not see one that passes through a variable or a function. Two
+       * shaders that compute the same position in these two ways would get
+       * results that differ in the last bits, and invariance promises equal
+       * ones. The operations that feed an invariant output are marked exact
+       * only later, in NIR.
        */
       const bool reassociate =
-         !mediump_16bit && !(b->nb.fp_math_ctrl & nir_fp_exact);
+         !mediump_16bit && !(b->nb.fp_math_ctrl & nir_fp_exact) &&
+         !b->has_invariant_output;
       struct vtn_ssa_value *dest;
       if (reassociate && opcode == SpvOpMatrixTimesVector) {
          dest = matrix_times_vector(b, w[3], vtn_src[1]);
