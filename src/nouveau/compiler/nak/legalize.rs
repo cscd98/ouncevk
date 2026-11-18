@@ -118,8 +118,17 @@ pub trait LegalizeBuildHelpers: SSABuilder {
             }
         }
 
+        // Only the uniform components need a warp copy. A copy of a warp
+        // component would give each instruction its own value for it, and
+        // RA would move that value into place again at every use: a LOD
+        // shared by four texture instructions was copied four times.
         if !all_same {
-            self.copy_ssa_ref(vec, file.to_warp());
+            let warp = file.to_warp();
+            for ssa in &mut vec[..] {
+                if ssa.file() != warp {
+                    self.copy_ssa(ssa, warp);
+                }
+            }
         }
     }
 

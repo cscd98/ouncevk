@@ -3640,10 +3640,10 @@ impl<'a> ShaderFromNir<'a> {
                 let within_workgroup =
                     within_subgroup || intrin.memory_scope() == SCOPE_WORKGROUP;
                 // L1 write-back and invalidation make global memory visible
-                // across SMs. A workgroup runs on one SM and shares its L1:
-                // ptxas emits no CCTL for SM86 fence.cta.
+                // to other threads' loads. A subgroup needs neither (see
+                // below).
                 let needs_cache_ops =
-                    (modes & nir_var_mem_global) != 0 && !within_workgroup;
+                    (modes & nir_var_mem_global) != 0 && !within_subgroup;
                 if needs_cache_ops && (semantics & NIR_MEMORY_RELEASE) != 0 {
                     // Pre-Volta doesn't have WBAll but it also seems that we
                     // don't need it.
@@ -3692,13 +3692,24 @@ impl<'a> ShaderFromNir<'a> {
                 let needs_membar =
                     intrin.memory_scope() != SCOPE_NONE && !fence_is_free;
                 if needs_membar {
-                    // A workgroup runs on one SM, so a CTA fence orders its
-                    // global memory and images as well as shared memory:
-                    // ptxas compiles SM86 fence.cta, which covers global
-                    // memory, to MEMBAR.CTA.
+                    // A workgroup fence on buffers or images is membar.gpu.
+                    // NAK's buffer and image accesses are Strong(GPU): their
+                    // loads read L2, and membar.cta does not wait for a store
+                    // to reach L2, so another warp of the workgroup could
+                    // still read the old value. (ptxas uses MEMBAR.CTA for
+                    // fence.cta, but its accesses are then CTA-scoped and go
+                    // through L1.) CTS memory_model.message_passing image
+                    // cases at workgroup scope failed with membar.cta.
+                    let global_modes =
+                        nir_var_image | nir_var_mem_global | nir_var_mem_ssbo;
                     let mem_scope = match intrin.memory_scope() {
-                        SCOPE_INVOCATION | SCOPE_SUBGROUP | SCOPE_WORKGROUP => {
-                            MemScope::CTA
+                        SCOPE_INVOCATION | SCOPE_SUBGROUP => MemScope::CTA,
+                        SCOPE_WORKGROUP => {
+                            if intrin.memory_modes() & global_modes != 0 {
+                                MemScope::GPU
+                            } else {
+                                MemScope::CTA
+                            }
                         }
                         SCOPE_QUEUE_FAMILY | SCOPE_DEVICE => MemScope::GPU,
                         _ => panic!("Unhandled memory scope"),

@@ -305,6 +305,15 @@ impl PartialOrd for LiveValue {
     }
 }
 
+/// The start registers of the ranges that a vector of `comps` components
+/// can take in a file of `num_regs` registers.
+fn aligned_ranges(num_regs: u32, comps: u8) -> impl Iterator<Item = u32> {
+    let align = usize::from(comps.next_power_of_two());
+    (0..num_regs)
+        .step_by(align)
+        .filter(move |reg| reg + u32::from(comps) <= num_regs)
+}
+
 #[derive(Clone)]
 struct RegAllocator {
     file: RegFile,
@@ -612,6 +621,17 @@ impl RegAllocator {
     }
 }
 
+/// The costs of collecting a vector source in a register range, per
+/// component, in register moves. A component that is not in its register
+/// yet needs one move. A register that holds an unrelated live value costs
+/// two more: that value moves out now, and usually back when the block
+/// ends, to restore the layout its successors expect.
+const COLLECT_MOVE_COST: u32 = 2;
+const COLLECT_EVICT_COST: u32 = 4;
+/// Less than any move: a free register planned for another vector's
+/// component only decides between ranges that cost the same.
+const COLLECT_PLANNED_COST: u32 = 1;
+
 struct VecRegAllocator<'a> {
     ra: &'a mut RegAllocator,
     pcopy: OpParCopy,
@@ -664,22 +684,6 @@ impl<'a> VecRegAllocator<'a> {
             self.assign_pin_reg(ssa, reg + u32::from(c));
         }
         RegRef::new(self.file(), reg, vec.comps())
-    }
-
-    fn try_find_unpinned_reg_range(
-        &self,
-        start_reg: u32,
-        comps: u8,
-        align_mul: u8,
-        align_offset: u8,
-    ) -> Option<u32> {
-        self.ra.try_find_unset_reg_range(
-            &self.pinned,
-            start_reg,
-            comps,
-            align_mul,
-            align_offset,
-        )
     }
 
     pub fn evict_ssa(&mut self, ssa: SSAValue, old_reg: u32) {
@@ -764,6 +768,33 @@ impl<'a> VecRegAllocator<'a> {
         self.ra.try_get_vec_reg(vec)
     }
 
+    /// The cost of collecting `vec` in the range that starts at `reg`.
+    fn collect_cost(&self, vec: &[SSAValue], reg: u32) -> u32 {
+        let mut cost = 0;
+        for (c, ssa) in vec.iter().enumerate() {
+            let comp_reg = reg + u32::try_from(c).unwrap();
+            if self.ra.try_get_reg(*ssa) != Some(comp_reg) {
+                cost += COLLECT_MOVE_COST;
+            }
+            match self.ra.try_get_ssa(comp_reg) {
+                // Another component of the vector moves to its own
+                // register anyway.
+                Some(occupant) if vec.contains(&occupant) => (),
+                Some(_) => cost += COLLECT_EVICT_COST,
+                None => {
+                    let planned_for_other =
+                        self.ra.reserved.iter().any(|(planned, planned_reg)| {
+                            *planned_reg == comp_reg && planned != ssa
+                        });
+                    if planned_for_other {
+                        cost += COLLECT_PLANNED_COST;
+                    }
+                }
+            }
+        }
+        cost
+    }
+
     pub fn collect_vector(&mut self, vec: &[SSAValue]) -> RegRef {
         if let Some(reg) = self.try_get_vec_reg(vec) {
             let comps = u8::try_from(vec.len()).unwrap();
@@ -772,34 +803,16 @@ impl<'a> VecRegAllocator<'a> {
         }
 
         let comps = u8::try_from(vec.len()).unwrap();
-        let align = comps.next_power_of_two();
 
-        let reg = self
-            .ra
-            .try_find_unused_reg_range(0, comps, align, 0)
-            .or_else(|| {
-                for c in 0..comps {
-                    let ssa = vec[usize::from(c)];
-                    let Some(comp_reg) = self.ra.try_get_reg(ssa) else {
-                        continue;
-                    };
-
-                    let vec_reg = comp_reg & !u32::from(align - 1);
-                    if comp_reg != vec_reg + u32::from(c) {
-                        continue;
-                    }
-
-                    if vec_reg + u32::from(comps) > self.ra.num_regs {
-                        continue;
-                    }
-
-                    if self.reg_range_is_unpinned(vec_reg, comps) {
-                        return Some(vec_reg);
-                    }
-                }
-                None
-            })
-            .or_else(|| self.try_find_unpinned_reg_range(0, comps, align, 0))
+        // The range that takes the fewest moves: one that already holds
+        // some components in place, or a free one, before one whose live
+        // values would have to move out. The first free aligned range was
+        // taken before, also when all but one component were in place
+        // elsewhere, and after it the first unpinned range, whatever it
+        // held.
+        let reg = aligned_ranges(self.ra.num_regs, comps)
+            .filter(|reg| self.reg_range_is_unpinned(*reg, comps))
+            .min_by_key(|reg| self.collect_cost(vec, *reg))
             .expect("Failed to find an unpinned register range");
 
         for c in 0..comps {
@@ -848,8 +861,16 @@ impl<'a> VecRegAllocator<'a> {
             return self.assign_pin_vec_reg(vec, reg);
         }
 
-        let reg = self
-            .try_find_unpinned_reg_range(0, comps, align, 0)
+        // No range is free: evict from the range that holds the fewest
+        // live values. Each eviction is a move, and usually another to
+        // restore the value when the block ends.
+        let reg = aligned_ranges(self.ra.num_regs, comps)
+            .filter(|reg| self.reg_range_is_unpinned(*reg, comps))
+            .min_by_key(|reg| {
+                (0..u32::from(comps))
+                    .filter(|c| self.ra.reg_is_used(reg + c))
+                    .count()
+            })
             .expect("Failed to find an unpinned register range");
 
         for c in 0..comps {

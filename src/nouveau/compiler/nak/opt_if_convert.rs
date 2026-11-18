@@ -54,8 +54,11 @@ use crate::opt_jump_thread::{opt_fall_through, rewrite_cfg};
 use rustc_hash::FxHashMap;
 
 /// The most instructions, both sides together, that are predicated
-/// instead of branched over.
-const MAX_PREDICATED_INSTRS: usize = 8;
+/// instead of branched over. At 16, a texture-path if/else of a terrain
+/// fragment shader (8 ALU and tex.ll against txd) is predicated, as NVIDIA
+/// does; on 444 corpus shaders 59 changed, none for the worse by static
+/// cycles, and none needed more registers.
+const MAX_PREDICATED_INSTRS: usize = 16;
 
 /// How one instruction of a body is converted.
 enum Conversion {

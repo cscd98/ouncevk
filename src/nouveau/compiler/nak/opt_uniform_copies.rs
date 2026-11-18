@@ -66,13 +66,13 @@ fn uniform_to_warp_copy(instr: &Instr) -> Option<(SSAValue, SSAValue)> {
 /// Whether `instr`, which defines a uniform GPR value, can write a warp GPR
 /// instead: a real, unpredicated instruction defining that one value
 /// (not a vector), without predicate or carry sources, whose warp form
-/// legalize can complete.
+/// legalize can complete. R2UR and REDUX write only uniform registers.
 fn can_move_to_warp(instr: &Instr) -> bool {
     let mut defs = 0;
     instr.for_each_ssa_def(|_| defs += 1);
     if instr.op.is_virtual()
         || !instr.pred.is_true()
-        || matches!(instr.op, Op::R2UR(_))
+        || matches!(instr.op, Op::R2UR(_) | Op::Redux(_))
         || defs != 1
     {
         return false;
