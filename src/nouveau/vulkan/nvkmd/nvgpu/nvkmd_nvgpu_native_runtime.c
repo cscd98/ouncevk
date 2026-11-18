@@ -19,6 +19,8 @@ static const char native_tsg_gpu_path[] = "/dev/nvhost-tsg-gpu";
 #define NATIVE_IOCTL_CTRL_GPU_TOPOLOGY       UINT32_C(0xc0084713) /* arg 8, out 24 */
 #define NATIVE_IOCTL_CTRL_GPU_ENGINE_CATALOG UINT32_C(0xc010471f) /* header 16, out 1024 */
 #define NATIVE_IOCTL_CTRL_GPU_TIME           UINT32_C(0xc010471c) /* in/out 16 */
+#define NATIVE_IOCTL_CTRL_GPU_ZCULL_CONTEXT_SIZE UINT32_C(0x80044701) /* out 4 */
+#define NATIVE_IOCTL_CTRL_GPU_ZCULL_INFO     UINT32_C(0x80284702) /* out 40 */
 /* /dev/nvhost-as-gpu ioctls. The import inserts the VM ID at +4.
  */
 #define NATIVE_IOCTL_AS_IMPORT  UINT32_C(0x40284109) /* in 40 */
@@ -102,6 +104,29 @@ characteristics_revision(const struct nvkmd_nvgpu_native_runtime *r)
           ((uint32_t)r->query_output[NATIVE_Q_REVISION + 1] << 8);
 }
 
+/* The ZCULL context-switch buffer size and geometry. ZCULL is optional: a
+ * failed query leaves it off and does not fail the runtime.
+ */
+static void
+query_zcull(struct nvkmd_nvgpu_native_runtime *r, u32 fd)
+{
+   struct nvkmd_nvgpu_native_zcull_query *zcull = &r->delegate.zcull;
+   _Alignas(8) uint32_t context_size_B = 0;
+   _Alignas(8) uint32_t info[NVKMD_NVGPU_NATIVE_ZCULL_INFO_WORDS] = {0};
+
+   Result rc = nvIoctl(fd, NATIVE_IOCTL_CTRL_GPU_ZCULL_CONTEXT_SIZE,
+                       &context_size_B);
+   if (R_SUCCEEDED(rc))
+      rc = nvIoctl(fd, NATIVE_IOCTL_CTRL_GPU_ZCULL_INFO, info);
+   zcull->result = rc;
+   if (R_FAILED(rc) || !context_size_B)
+      return;
+
+   zcull->context_size_B = context_size_B;
+   memcpy(zcull->info, info, sizeof(info));
+   zcull->queried = true;
+}
+
 /* nvhost-ctrl-gpu queries on a control fd that is closed afterwards. The
  * native profile screen and version floor are OunceVK policy: later code assumes
  * model 0x808.
@@ -130,6 +155,8 @@ query_control(struct nvkmd_nvgpu_native_runtime *r)
    if (R_SUCCEEDED(rc))
       rc = nvIoctl3(fd, NATIVE_IOCTL_CTRL_GPU_TOPOLOGY, topology_argument,
                     r->delegate.topology, NATIVE_TOPOLOGY_OUTPUT_B);
+   if (R_SUCCEEDED(rc))
+      query_zcull(r, fd);
 
    const Result close_rc = nvClose(fd);
    if (R_SUCCEEDED(rc))

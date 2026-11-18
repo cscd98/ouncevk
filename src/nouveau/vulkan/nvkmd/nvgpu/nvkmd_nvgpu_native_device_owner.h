@@ -251,6 +251,14 @@ struct nvkmd_nvgpu_native_device_owner {
    struct nvkmd_nvgpu_native_backing notifier;
    struct nvkmd_nvgpu_native_channel channel;
    struct nvkmd_nvgpu_native_channel_setup setup;
+   /* The ZCULL context-switch buffer, a slice of the primary segment bound
+    * to the graphics TSG. It stays for the device lifetime: the firmware keeps
+    * the binding in the TSG graphics context, and nothing unbinds it.
+    * zcull_bound is false when the queries or the bind failed; ZCULL is then
+    * off. */
+   struct nvkmd_nvgpu_native_slice zcull_context;
+   bool zcull_bound;
+   Result zcull_result;
    struct nvkmd_nvgpu_native_copy_channel copy;
    struct nvkmd_nvgpu_native_va_owner va;
    struct nvkmd_nvgpu_native_va_lease lease;

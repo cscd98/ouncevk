@@ -422,6 +422,67 @@ native_open(struct vk_object_base *log_obj)
    return result;
 }
 
+/* The most ZCULL subregions NIL handles (nil/zcull.rs MAX_SUBREGIONS). */
+#define NATIVE_ZCULL_MAX_SUBREGIONS 16
+/* The ZCULL context alignment. */
+#define NATIVE_ZCULL_CONTEXT_ALIGN_B 0x1000
+
+/* Publishes ZCULL in the device information when the context buffer is
+ * bound. The geometry words come in wire order: the last three are the
+ * subregion width and height alignments and the subregion count, while
+ * Mesa's structure has the count first. Values NIL cannot use leave ZCULL
+ * off.
+ */
+static void
+native_publish_zcull(struct nv_device_info *info)
+{
+   const struct nvkmd_nvgpu_native_zcull_query *zcull =
+      &native_runtime.delegate.zcull;
+   if (!native_device.zcull_bound) {
+      mesa_logi("native ZCULL off: queried %d bound %d query 0x%x bind 0x%x",
+                zcull->queried, native_device.zcull_bound,
+                zcull->result, native_device.zcull_result);
+      return;
+   }
+
+   const uint32_t *w = zcull->info;
+   const struct nv_zcull_device_info zcull_info = {
+      .width_align_pixels = w[0],
+      .height_align_pixels = w[1],
+      .pixel_squares_by_aliquots = w[2],
+      .aliquot_total = w[3],
+      .zcull_region_byte_multiplier = w[4],
+      .zcull_region_header_size = w[5],
+      .zcull_subregion_header_size = w[6],
+      .subregion_count = w[9],
+      .subregion_width_align_pixels = w[7],
+      .subregion_height_align_pixels = w[8],
+      .ctxsw_size = zcull->context_size_B,
+      .ctxsw_align = NATIVE_ZCULL_CONTEXT_ALIGN_B,
+   };
+   mesa_logi("native ZCULL: align %ux%u squares/aliquot %u aliquots %u "
+             "multiplier %u headers %u/%u subregions %u (%ux%u) context %u",
+             zcull_info.width_align_pixels, zcull_info.height_align_pixels,
+             zcull_info.pixel_squares_by_aliquots, zcull_info.aliquot_total,
+             zcull_info.zcull_region_byte_multiplier,
+             zcull_info.zcull_region_header_size,
+             zcull_info.zcull_subregion_header_size,
+             zcull_info.subregion_count,
+             zcull_info.subregion_width_align_pixels,
+             zcull_info.subregion_height_align_pixels,
+             zcull_info.ctxsw_size);
+   if (!zcull_info.width_align_pixels || !zcull_info.height_align_pixels ||
+       !zcull_info.pixel_squares_by_aliquots || !zcull_info.aliquot_total ||
+       !zcull_info.zcull_region_byte_multiplier ||
+       !zcull_info.subregion_count ||
+       zcull_info.subregion_count > NATIVE_ZCULL_MAX_SUBREGIONS ||
+       !zcull_info.subregion_width_align_pixels ||
+       !zcull_info.subregion_height_align_pixels)
+      return;
+   info->zcull_info = zcull_info;
+   info->has_zcull_info = true;
+}
+
 VkResult
 nvkmd_nvgpu_try_create_pdev(struct vk_object_base *log_obj,
                             enum nvk_debug debug_flags,
@@ -447,6 +508,7 @@ nvkmd_nvgpu_try_create_pdev(struct vk_object_base *log_obj,
    /* A transfer queue family on the copy channel. */
    info.has_transfer_queue =
       nvkmd_nvgpu_native_owner_open_copy_channel(&native_device);
+   native_publish_zcull(&info);
    return nvkmd_nvgpu_native_create_pdev(&native_device, &info, debug_flags,
                                          pdev_out);
 }

@@ -15,6 +15,7 @@
 
 #include "util/bitpack_helpers.h"
 #include "util/compiler.h"
+#include "util/u_atomic.h"
 #include "vk_format.h"
 #include "vk_render_pass.h"
 #include "vk_standard_sample_locations.h"
@@ -1197,6 +1198,53 @@ nvk_vk_format_to_zcull_format(VkFormat format) {
    }
 }
 
+/* ZCULL keeps one depth bound for each tile. SET_ZCULL_DIR_FORMAT selects
+ * the direction of that bound and its encoding. A direction that does not
+ * match the depth test only stops culling, but ZCULL data built with one
+ * value must not be loaded with another. So one value serves every render
+ * pass on an image: the first pass chooses it, from its clear value if it
+ * clears.
+ *
+ * A clear below 0.5 (reversed depth) selects GREATER and other clears
+ * select LESS, and a clear other than exactly 0 or 1 selects the MSB
+ * encoding. For a clear of 0 or 1, the encoding of the depth format is
+ * used.
+ */
+struct nvk_zcull_dir_format {
+   uint32_t zdir;
+   uint32_t zformat;
+};
+
+static struct nvk_zcull_dir_format
+nvk_zcull_dir_format(struct nvk_zcull_plane *plane,
+                     const VkRenderingAttachmentInfo *depth_att,
+                     VkFormat format)
+{
+   struct nvk_zcull_dir_format chosen = {
+      .zdir = NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_LESS,
+      .zformat = nvk_vk_format_to_zcull_format(format),
+   };
+   if (depth_att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      const float depth = depth_att->clearValue.depthStencil.depth;
+      if (depth < 0.5f)
+         chosen.zdir = NV9097_SET_ZCULL_DIR_FORMAT_ZDIR_GREATER;
+      if (depth != 0.0f && depth != 1.0f)
+         chosen.zformat = NV9097_SET_ZCULL_DIR_FORMAT_ZFORMAT_MSB;
+   }
+   if (plane == NULL)
+      return chosen;
+
+   const uint32_t packed = (chosen.zformat << 16) | chosen.zdir;
+   const uint32_t stored =
+      p_atomic_cmpxchg(&plane->dir_format_plus_one, 0, packed + 1);
+   if (stored == 0)
+      return chosen;
+   return (struct nvk_zcull_dir_format) {
+      .zdir = (stored - 1) & 0xffff,
+      .zformat = (stored - 1) >> 16,
+   };
+}
+
 VKAPI_ATTR void VKAPI_CALL
 nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                       const VkRenderingInfo *pRenderingInfo)
@@ -1590,13 +1638,12 @@ nvk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          .smask = 0,
       });
 
-      VkFormat fmt = render->depth_att.iview->vk.format;
+      const struct nvk_zcull_dir_format dir_format =
+         nvk_zcull_dir_format(zcull_plane, pRenderingInfo->pDepthAttachment,
+                              render->depth_att.iview->vk.format);
       P_IMMD(p, NV9097, SET_ZCULL_DIR_FORMAT, {
-         /* I've tried a variety of depthCompareOp values and depth clear
-          * values, but the blob seems to always use ZDIR_LESS
-          */
-         .zdir = ZDIR_LESS,
-         .zformat = nvk_vk_format_to_zcull_format(fmt),
+         .zdir = dir_format.zdir,
+         .zformat = dir_format.zformat,
       });
 
       P_0INC(p, NV9297, SET_ZCULL_SUBREGION_ALLOCATION);

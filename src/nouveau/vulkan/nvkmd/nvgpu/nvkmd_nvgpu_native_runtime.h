@@ -81,6 +81,18 @@ struct nvkmd_nvgpu_runtime_as_region {
    uint64_t page_count;
 };
 
+/* The ZCULL queries on the control GPU: the context-switch buffer size and the
+ * ten geometry and storage words, in wire order. queried is set only when both
+ * queries succeeded.
+ */
+#define NVKMD_NVGPU_NATIVE_ZCULL_INFO_WORDS 10
+struct nvkmd_nvgpu_native_zcull_query {
+   bool queried;
+   Result result;
+   uint32_t context_size_B;
+   uint32_t info[NVKMD_NVGPU_NATIVE_ZCULL_INFO_WORDS];
+};
+
 struct nvkmd_nvgpu_native_runtime {
    const struct nvkmd_nvgpu_native_runtime *self;
    uint64_t generation;
@@ -99,6 +111,7 @@ struct nvkmd_nvgpu_native_runtime {
       struct nvkmd_nvgpu_native_resource_policy resource_policy;
       uint32_t tpc_mask;
       uint8_t topology[24];
+      struct nvkmd_nvgpu_native_zcull_query zcull;
    } delegate;
    uint8_t query_argument[NVKMD_NVGPU_NATIVE_CHARACTERISTICS_ARG_SIZE];
    uint8_t query_output[NVKMD_NVGPU_NATIVE_CHARACTERISTICS_SIZE];

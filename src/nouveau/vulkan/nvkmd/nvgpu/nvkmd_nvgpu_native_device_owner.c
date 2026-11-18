@@ -25,6 +25,49 @@
  * registers one notifier page. */
 #define NOTIFIER_LOCAL_HANDLE 1u
 
+/* ZCULL context bind on the 3D channel fd: {u64 GPU byte address, u32 mode,
+ * u32 0}. Mode 2 is a separate context buffer.
+ */
+#define ZCULL_BIND_IOCTL UINT32_C(0xc010480b)
+#define ZCULL_BIND_MODE_SEPARATE_BUFFER 2u
+#define ZCULL_CONTEXT_ALIGN_B UINT64_C(0x1000)
+
+/* Binds a ZCULL context-switch buffer to the graphics TSG, after the 3D
+ * channel is configured and before its first commands. ZCULL is optional:
+ * on any failure it stays off and the device works without it.
+ *
+ * The buffer has the ordinary kind 6, which the primary segment uses.
+ * OunceVK clears it so that the first context switch starts from defined
+ * contents. The primary segment is uncached, so the stores reach memory.
+ */
+static void
+bind_zcull_context(struct nvkmd_nvgpu_native_device_owner *owner,
+                   const struct nvkmd_nvgpu_native_runtime *runtime)
+{
+   const struct nvkmd_nvgpu_native_zcull_query *zcull =
+      &runtime->delegate.zcull;
+   if (!zcull->queried)
+      return;
+
+   if (nvkmd_nvgpu_native_arena_alloc(&owner->arena, zcull->context_size_B,
+                                      ZCULL_CONTEXT_ALIGN_B,
+                                      &owner->zcull_context) !=
+       NVKMD_NVGPU_NATIVE_ARENA_OK)
+      return;
+   memset((void *)(uintptr_t)owner->zcull_context.cpu, 0,
+          owner->zcull_context.length);
+
+   _Alignas(8) uint32_t payload[4] = {
+      (uint32_t)owner->zcull_context.gpu,
+      (uint32_t)(owner->zcull_context.gpu >> 32),
+      ZCULL_BIND_MODE_SEPARATE_BUFFER,
+      0,
+   };
+   owner->zcull_result = nvIoctl(owner->channel.channel_fd, ZCULL_BIND_IOCTL,
+                                 payload);
+   owner->zcull_bound = R_SUCCEEDED(owner->zcull_result);
+}
+
 _Static_assert(NVKMD_NVGPU_NATIVE_PRIMARY_B +
                NVKMD_NVGPU_NATIVE_PLACEMENT_ALIGN_B +
                NVKMD_NVGPU_NATIVE_NOTIFIER_PAGE_B <=
@@ -169,6 +212,7 @@ nvkmd_nvgpu_native_device_prepare(
            result ? owner->setup.result : 0);
    if (result != NVKMD_NVGPU_CHANNEL_SETUP_OK)
       return false;
+   bind_zcull_context(owner, runtime);
 
    owner->arena_ref = &owner->arena;
    owner->arena.owner = owner;

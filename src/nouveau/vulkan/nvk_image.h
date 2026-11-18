@@ -91,6 +91,10 @@ struct nvk_zcull_plane {
    struct nil_zcull nil;
    uint64_t addr;
    uint64_t plane_offset_B;
+   /* The SET_ZCULL_DIR_FORMAT value of every render pass on this image, plus
+    * one: zero until the first render pass chooses it
+    * (nvk_zcull_dir_format). */
+   uint32_t dir_format_plus_one;
 };
 
 struct nvk_image {
