@@ -28,6 +28,9 @@ struct nvkmd_nvgpu_native_chunk {
    uint64_t stranded_va;
    /* With stranded_va: the hold of the VA of the chunk's allocation. */
    struct nvkmd_nvgpu_native_va_hold *va_hold;
+   /* The chunk was mapped with a compressible kind: its backing has
+    * compression tags until it is released. */
+   bool compressible;
 };
 
 /* A part of a memory range that lies in one backing, for a view. */
@@ -41,15 +44,20 @@ struct nvkmd_nvgpu_native_view_part {
 bool nvkmd_nvgpu_native_mem_is_chunked(const struct nvkmd_mem *mem);
 
 /* GPU-only memory of size_B (rounded up to whole chunks), at a VA aligned
- * to align_B, with PTE kind 6 and the GPU cache on. */
+ * to align_B, with the GPU cache on. pte_kind is 6, or a compressible kind
+ * for compressed memory (flags has NVKMD_MEM_COMPRESSED). Compressed memory
+ * is mapped with that kind in every chunk or not made:
+ * VK_ERROR_FORMAT_NOT_SUPPORTED when the service mapped the ordinary
+ * fallback kind (no compression tags were free). */
 VkResult nvkmd_nvgpu_native_chunked_mem_create(
    struct nvkmd_dev *dev, struct nvkmd_nvgpu_native_device_owner *owner,
    uint64_t size_B, uint64_t align_B, enum nvkmd_mem_flags flags,
-   struct nvkmd_mem **mem_out);
+   uint8_t pte_kind, struct nvkmd_mem **mem_out);
 
 /* The parts of [offset_B, +size_B) of chunked memory, one for each chunk
  * that the range touches. Returns the number of parts, or 0 when the range
- * is not in the memory or max is too small. */
+ * is not in the memory or max is too small. Compressed memory has no parts:
+ * a view of it with another kind would read the compressed bytes. */
 uint32_t nvkmd_nvgpu_native_chunked_mem_parts(
    const struct nvkmd_mem *mem, uint64_t offset_B, uint64_t size_B,
    struct nvkmd_nvgpu_native_view_part *parts, uint32_t max);

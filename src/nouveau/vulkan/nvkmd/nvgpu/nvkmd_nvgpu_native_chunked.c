@@ -38,6 +38,8 @@ struct nvkmd_nvgpu_native_chunked_mem {
    struct nvkmd_va va;
    struct nvkmd_nvgpu_native_va_hold *va_hold;
    struct nvkmd_nvgpu_native_device_owner *owner;
+   /* Every chunk is mapped with a compressible kind. */
+   bool compressed;
    struct list_head link; /* in owner->chunked_mems */
    uint32_t chunk_count;
    struct nvkmd_nvgpu_native_chunk *chunks[];
@@ -148,12 +150,20 @@ native_chunk_register(struct nvkmd_nvgpu_native_device_owner *owner,
 }
 
 /* A chunk from the pool, or a new registered chunk (*created is then
- * incremented). Call with the owner lock held. */
+ * incremented). Compressed memory takes a chunk that has compression tags
+ * first. Call with the owner lock held. */
 static struct nvkmd_nvgpu_native_chunk *
 native_chunk_take(struct nvkmd_nvgpu_native_device_owner *owner,
-                  uint32_t *created)
+                  bool compressed, uint32_t *created)
 {
-   struct nvkmd_nvgpu_native_chunk *chunk = owner->free_chunks;
+   struct nvkmd_nvgpu_native_chunk *chunk = owner->free_compressible_chunks;
+   if (compressed && chunk) {
+      owner->free_compressible_chunks = chunk->next;
+      owner->free_compressible_chunk_count--;
+      chunk->next = NULL;
+      return chunk;
+   }
+   chunk = owner->free_chunks;
    if (chunk) {
       owner->free_chunks = chunk->next;
       owner->free_chunk_count--;
@@ -187,10 +197,20 @@ native_chunk_release(struct nvkmd_nvgpu_native_device_owner *owner,
    return true;
 }
 
+/* Returns a chunk to its pool. A chunk that was mapped compressed goes to
+ * the compressible pool: ordinary memory never maps it again, so the GPU
+ * never reads its bytes with and without compression. Its tags stay with
+ * its backing until the release. */
 static void
 native_chunk_give_back(struct nvkmd_nvgpu_native_device_owner *owner,
                        struct nvkmd_nvgpu_native_chunk *chunk)
 {
+   if (chunk->compressible) {
+      chunk->next = owner->free_compressible_chunks;
+      owner->free_compressible_chunks = chunk;
+      owner->free_compressible_chunk_count++;
+      return;
+   }
    chunk->next = owner->free_chunks;
    owner->free_chunks = chunk;
    owner->free_chunk_count++;
@@ -294,26 +314,42 @@ native_chunked_mem_retire(struct nvkmd_nvgpu_native_chunked_mem *mem)
  * larger one) adds its chunks on top. With a limit at the reserve, each
  * such free released the chunks that the reserve had just registered:
  * 197 of 246 in one game session. */
+/* Releases chunks of one pool until it has keep chunks. Stops at a failed
+ * release, which keeps the rest in the pool. */
+static void
+native_chunk_pool_release(struct nvkmd_nvgpu_native_device_owner *owner,
+                          struct nvkmd_nvgpu_native_chunk **pool,
+                          uint32_t *count, uint32_t keep)
+{
+   while (*count > keep) {
+      struct nvkmd_nvgpu_native_chunk *chunk = *pool;
+      *pool = chunk->next;
+      (*count)--;
+      if (!native_chunk_release(owner, chunk))
+         break;
+   }
+}
+
 static void
 native_chunk_pool_trim(struct nvkmd_nvgpu_native_device_owner *owner,
                        struct nvkmd_dev *dev)
 {
-   const uint32_t keep =
-      (uint32_t)(NATIVE_CHUNK_POOL_B / NVKMD_NVGPU_NATIVE_CHUNK_B) +
-      owner->chunk_reserve_target;
-   if (owner->free_chunk_count <= keep)
+   const uint32_t pool_chunks =
+      (uint32_t)(NATIVE_CHUNK_POOL_B / NVKMD_NVGPU_NATIVE_CHUNK_B);
+   const uint32_t keep = pool_chunks + owner->chunk_reserve_target;
+   if (owner->free_chunk_count <= keep &&
+       owner->free_compressible_chunk_count <= pool_chunks)
       return;
    /* The GPU L2 can hold lines of these chunks: complete earlier work and
     * write back dirty lines first. */
    if (nvkmd_nvgpu_native_owner_finish_flush(owner, dev) != VK_SUCCESS)
       return;
-   while (owner->free_chunk_count > keep) {
-      struct nvkmd_nvgpu_native_chunk *chunk = owner->free_chunks;
-      owner->free_chunks = chunk->next;
-      owner->free_chunk_count--;
-      if (!native_chunk_release(owner, chunk))
-         break; /* keep the rest in the pool */
-   }
+   native_chunk_pool_release(owner, &owner->free_chunks,
+                             &owner->free_chunk_count, keep);
+   /* The release also frees the chunk's compression tags. */
+   native_chunk_pool_release(owner, &owner->free_compressible_chunks,
+                             &owner->free_compressible_chunk_count,
+                             pool_chunks);
 }
 
 static void
@@ -423,10 +459,13 @@ VkResult
 nvkmd_nvgpu_native_chunked_mem_create(
    struct nvkmd_dev *dev, struct nvkmd_nvgpu_native_device_owner *owner,
    uint64_t size_B, uint64_t align_B, enum nvkmd_mem_flags flags,
-   struct nvkmd_mem **mem_out)
+   uint8_t pte_kind, struct nvkmd_mem **mem_out)
 {
+   const bool compressed = flags & NVKMD_MEM_COMPRESSED;
    if (!dev || !owner || !mem_out || !size_B ||
-       size_B > UINT64_MAX - NVKMD_NVGPU_NATIVE_CHUNK_B)
+       size_B > UINT64_MAX - NVKMD_NVGPU_NATIVE_CHUNK_B ||
+       (compressed ? !nvkmd_nvgpu_native_kind_is_compressible(pte_kind)
+                   : pte_kind != NATIVE_CHUNK_KIND))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const uint64_t length_B = align64(size_B, NVKMD_NVGPU_NATIVE_CHUNK_B);
    const uint64_t count64 = length_B / NVKMD_NVGPU_NATIVE_CHUNK_B;
@@ -457,23 +496,27 @@ nvkmd_nvgpu_native_chunked_mem_create(
    uint32_t mapped = 0, created = 0;
    for (uint32_t i = 0; result == VK_SUCCESS && i < count; i++) {
       struct nvkmd_nvgpu_native_chunk *chunk =
-         native_chunk_take(owner, &created);
+         native_chunk_take(owner, compressed, &created);
       if (!chunk) {
          result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
          break;
       }
       Result rc = 0;
+      uint8_t selected_kind = pte_kind;
+      const uint64_t chunk_va = va + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B;
       const enum nvkmd_nvgpu_native_map_status status =
-         nvkmd_nvgpu_native_map_range(
-            owner->runtime, &chunk->backing,
-            va + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B, 0,
-            NVKMD_NVGPU_NATIVE_CHUNK_B, NATIVE_CHUNK_KIND, true,
-            &owner->slot, &rc);
+         compressed ?
+            nvkmd_nvgpu_native_map_range_compressible(
+               owner->runtime, &chunk->backing, chunk_va, 0,
+               NVKMD_NVGPU_NATIVE_CHUNK_B, pte_kind, true, &owner->slot,
+               &selected_kind, &rc) :
+            nvkmd_nvgpu_native_map_range(
+               owner->runtime, &chunk->backing, chunk_va, 0,
+               NVKMD_NVGPU_NATIVE_CHUNK_B, NATIVE_CHUNK_KIND, true,
+               &owner->slot, &rc);
       if (status != NVKMD_NVGPU_NATIVE_MAP_OK) {
          mesa_loge("native chunk: map failed: status %u, result 0x%x",
                    (unsigned)status, rc);
-         const uint64_t chunk_va =
-            va + (uint64_t)i * NVKMD_NVGPU_NATIVE_CHUNK_B;
          if (status == NVKMD_NVGPU_NATIVE_MAP_KIND) {
             /* Mapped with another kind. */
             native_chunk_unmap_give_back(owner, chunk, chunk_va, hold);
@@ -490,6 +533,16 @@ nvkmd_nvgpu_native_chunked_mem_create(
       }
       mem->chunks[i] = chunk;
       mapped++;
+      if (selected_kind != pte_kind) {
+         /* The ordinary fallback: no compression tags were free. The memory
+          * is compressed in every chunk or not at all. The chunks mapped so
+          * far are unmapped below. */
+         owner->stats.compression_fallbacks++;
+         result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+         break;
+      }
+      if (compressed)
+         chunk->compressible = true;
    }
    if (result != VK_SUCCESS) {
       if (va)
@@ -502,8 +555,11 @@ nvkmd_nvgpu_native_chunked_mem_create(
    }
    mem->chunk_count = count;
    mem->va_hold = hold;
+   mem->compressed = compressed;
    list_addtail(&mem->link, &owner->chunked_mems);
    owner->stats.chunked_mems++;
+   if (compressed)
+      owner->stats.compressed_mems++;
    native_chunk_reserve_note(owner, count, created);
    nvkmd_nvgpu_native_owner_unlock(owner);
 
@@ -529,6 +585,8 @@ nvkmd_nvgpu_native_chunked_mem_parts(
       return 0;
    const struct nvkmd_nvgpu_native_chunked_mem *mem =
       container_of(base, const struct nvkmd_nvgpu_native_chunked_mem, base);
+   if (mem->compressed)
+      return 0;
    uint32_t count = 0;
    uint64_t done_B = 0;
    while (done_B < size_B) {
@@ -624,6 +682,13 @@ nvkmd_nvgpu_native_owner_release_chunks(
       owner->free_chunks = chunk->next;
       owner->free_chunk_count--;
       /* A failed release strands the chunk. */
+      native_chunk_release(owner, chunk);
+   }
+   while (owner->free_compressible_chunks) {
+      struct nvkmd_nvgpu_native_chunk *chunk =
+         owner->free_compressible_chunks;
+      owner->free_compressible_chunks = chunk->next;
+      owner->free_compressible_chunk_count--;
       native_chunk_release(owner, chunk);
    }
    /* Try every stranded chunk once more, those of the pool included. The

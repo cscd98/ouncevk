@@ -1669,7 +1669,12 @@ nvk_image_plane_bind(struct nvk_device *dev,
    const bool not_shared = !(mem->mem->flags & NVKMD_MEM_SHARED);
 
    if (plane->nil.pte_kind != 0) {
-      if (mem->dedicated_image == image && image->can_compress && not_shared) {
+      /* The backend can give a request for compressed memory ordinary
+       * memory (the native backend does when no compression tags are free,
+       * or for host-visible or small memory). That memory is bound below,
+       * as for any other image. */
+      if (mem->dedicated_image == image && image->can_compress && not_shared &&
+          (mem->mem->flags & NVKMD_MEM_COMPRESSED)) {
          image->is_compressed = true;
          plane->addr = mem->mem->va->addr + offset_B;
       } else if (not_shared && image->plane_count == 1 &&

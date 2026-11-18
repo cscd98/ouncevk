@@ -176,6 +176,28 @@ enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_range(
    uint8_t kind, bool gpu_cacheable,
    struct nvkmd_nvgpu_native_slot *slot, Result *result_out);
 
+/* The compressible PTE kinds, 8-14. Each has an ordinary fallback kind.
+ */
+bool nvkmd_nvgpu_native_kind_is_compressible(uint8_t kind);
+
+/* The ordinary kind that the service maps instead of a compressible kind
+ * when it cannot assign compression tags. */
+uint8_t nvkmd_nvgpu_native_kind_fallback(uint8_t kind);
+
+/* Like nvkmd_nvgpu_native_map_range with a compressible kind (8-14) and its
+ * ordinary fallback. The service assigns compression tags to the backing
+ * for the mapped range, or maps the fallback kind when it cannot.
+ * *selected_kind_out is the kind of the mapping on NVKMD_NVGPU_NATIVE_MAP_OK:
+ * the compressible kind or the fallback.
+ */
+enum nvkmd_nvgpu_native_map_status nvkmd_nvgpu_native_map_range_compressible(
+   struct nvkmd_nvgpu_native_runtime *runtime,
+   struct nvkmd_nvgpu_native_backing *backing,
+   uint64_t gpu_va, uint64_t backing_offset_B, uint64_t size_B,
+   uint8_t kind, bool gpu_cacheable,
+   struct nvkmd_nvgpu_native_slot *slot, uint8_t *selected_kind_out,
+   Result *result_out);
+
 /* Removes a mapping of nvkmd_nvgpu_native_map_range (worker raw 0xe5 over
  * the same interval) and waits for the slot. After a failure the mapping
  * may remain; call this again with the same interval. An unmap that the

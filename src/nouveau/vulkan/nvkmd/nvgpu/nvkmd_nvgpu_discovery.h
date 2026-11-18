@@ -77,6 +77,9 @@ struct nvkmd_nvgpu_native_budget_snapshot {
    uint32_t present_producers, present_complete, present_unsubmitted;
    uint32_t join_waits;
    uint32_t kind_changes, kind_failures;
+   /* Compressed memory objects made, and compressed requests that the
+    * service mapped with the ordinary fallback kind. */
+   uint32_t compressed_mems, compression_fallbacks;
    bool kind_alias_ready;
    uint32_t small_execs;
    uint64_t exec_bytes;

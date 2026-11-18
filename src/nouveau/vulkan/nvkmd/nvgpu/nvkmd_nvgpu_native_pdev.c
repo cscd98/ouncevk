@@ -8,6 +8,7 @@
 #include "nvkmd_nvgpu_native_mem.h"
 #include "nvkmd_nvgpu_native_chunked.h"
 #include "nvkmd_nvgpu_native_host_mem.h"
+#include "nvkmd_nvgpu_native_map.h"
 #include "nvkmd_nvgpu_native_ctx.h"
 #include "nvkmd_nvgpu_native_progress.h"
 #include "nvkmd_nvgpu_native_runtime.h"
@@ -208,6 +209,65 @@ native_segment_fits(const struct nvkmd_nvgpu_native_segment *segment,
           segment->length_B - size_B < NVKMD_NVGPU_NATIVE_POOL_SEGMENT_B;
 }
 
+/* The service assigns compression tags in 64 KiB units of a backing. A
+ * chunk is a whole number of them, so no two allocations share a unit.
+ */
+#define NATIVE_COMPRESSION_PAGE_B 0x10000
+
+static bool
+native_compression_page_valid(
+   const struct nvkmd_nvgpu_native_device_owner *owner)
+{
+   const uint32_t page_B = owner->runtime->delegate.characteristics
+                              .compression_page_size_raw;
+   return page_B == NATIVE_COMPRESSION_PAGE_B &&
+          NVKMD_NVGPU_NATIVE_CHUNK_B % page_B == 0;
+}
+
+/* Compressed memory is chunked memory from this size: compression pays for
+ * render-target-sized images, and chunked memory rounds up to whole chunks.
+ * A 1080p RGBA8 or D32 target is 7.9 MiB. */
+#define NATIVE_COMPRESSED_MIN_B (NVKMD_NVGPU_NATIVE_CHUNK_B / 2)
+
+/* dev_mmu.h: NV_MMU_PTE_KIND_GENERIC_MEMORY, its compressible kind and the
+ * PLC-disabled compressible kind. */
+#define NATIVE_PTE_KIND_GENERIC 0x6
+#define NATIVE_PTE_KIND_GENERIC_COMPRESSIBLE 0x8
+#define NATIVE_PTE_KIND_GENERIC_COMPRESSIBLE_DISABLE_PLC 0x9
+
+/* The kind that compressed memory maps for NIL's compressed kind. Generic
+ * compressed memory (colour and D32) is mapped with kind 9, the PLC-
+ * disabled variant, where NIL chooses 8. The depth and stencil kinds
+ * 0xa-0xe are PLC-disabled in both.
+ */
+static uint8_t
+native_compressed_kind(uint8_t nil_kind)
+{
+   if (nil_kind == NATIVE_PTE_KIND_GENERIC_COMPRESSIBLE)
+      return NATIVE_PTE_KIND_GENERIC_COMPRESSIBLE_DISABLE_PLC;
+   return nil_kind;
+}
+
+/* Compressed memory: GPU-only chunked memory mapped with a compressible
+ * kind. Returns VK_ERROR_FORMAT_NOT_SUPPORTED when this request cannot be
+ * compressed: it is not GPU-only or not large enough, or the service mapped
+ * the ordinary fallback kind. */
+static VkResult
+native_dev_compressed_mem_create(struct nvkmd_nvgpu_native_dev *dev,
+                                 uint64_t size_B, uint64_t align_B,
+                                 enum nvkmd_mem_flags flags, uint8_t pte_kind,
+                                 struct nvkmd_mem **mem_out)
+{
+   const uint8_t kind = native_compressed_kind(pte_kind);
+   if (native_segment_kind(flags) != NVKMD_NVGPU_SEGMENT_CACHED ||
+       size_B < NATIVE_COMPRESSED_MIN_B ||
+       !nvkmd_nvgpu_native_kind_is_compressible(kind))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   return nvkmd_nvgpu_native_chunked_mem_create(&dev->base, dev->owner,
+                                                size_B, align_B, flags, kind,
+                                                mem_out);
+}
+
 /* Tries the kind's arenas in creation order. When none has room, it creates
  * a segment for this allocation. Large allocations never use the primary
  * segment, which holds the submission chunks.
@@ -221,6 +281,19 @@ native_dev_mem_create(struct nvkmd_nvgpu_native_dev *dev,
                       struct nvkmd_mem **mem_out)
 {
    struct nvkmd_nvgpu_native_device_owner *owner = dev->owner;
+   if (flags & NVKMD_MEM_COMPRESSED) {
+      const VkResult result = owner->segments_enabled ?
+         native_dev_compressed_mem_create(dev, size_B, align_B, flags,
+                                          pte_kind, mem_out) :
+         VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (result != VK_ERROR_FORMAT_NOT_SUPPORTED)
+         return result;
+      /* Ordinary memory without NVKMD_MEM_COMPRESSED: NVK binds the image
+       * uncompressed, with a kind alias. */
+      flags &= ~NVKMD_MEM_COMPRESSED;
+      pte_kind = 0;
+      tile_mode = 0;
+   }
    if (!owner->segments_enabled)
       return nvkmd_nvgpu_native_mem_create(
          &dev->base, owner->arena_ref, size_B, align_B, flags, pte_kind,
@@ -231,9 +304,11 @@ native_dev_mem_create(struct nvkmd_nvgpu_native_dev *dev,
     * consecutive VA offsets, so it needs no CPU-contiguous span. */
    if (kind == NVKMD_NVGPU_SEGMENT_CACHED &&
        nvkmd_nvgpu_native_segment_dedicated(size_B) &&
-       (pte_kind == 0 || pte_kind == 6))
+       (pte_kind == 0 || pte_kind == NATIVE_PTE_KIND_GENERIC))
       return nvkmd_nvgpu_native_chunked_mem_create(&dev->base, owner, size_B,
-                                                   align_B, flags, mem_out);
+                                                   align_B, flags,
+                                                   NATIVE_PTE_KIND_GENERIC,
+                                                   mem_out);
    VkResult result;
    if (kind == NVKMD_NVGPU_SEGMENT_UNCACHED &&
        !nvkmd_nvgpu_native_segment_dedicated(size_B)) {
@@ -789,6 +864,12 @@ nvkmd_nvgpu_native_create_pdev(
     * the bind context. Sparse residency is not reported (no zero pages
     * for unbound ranges). */
    pdev->base.kmd_info.has_sparse = true;
+   /* Compression: NVK asks for compressed memory for dedicated images
+    * (nvk_image_can_compress), which GPU-only chunked memory maps with a
+    * compressible kind. NVK binds an image as compressed only when its
+    * memory has NVKMD_MEM_COMPRESSED. */
+   pdev->base.kmd_info.has_compression =
+      owner->segments_enabled && native_compression_page_valid(owner);
    pdev->owner = owner;
    pdev->timeline_type =
       vk_sync_timeline_get_type(&nvkmd_nvgpu_native_syncobj_type);

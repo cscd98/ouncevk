@@ -197,6 +197,8 @@ nvkmd_nvgpu_native_budget_snapshot(
       .join_waits = d->stats.join_waits,
       .kind_changes = d->stats.kind_changes,
       .kind_failures = d->stats.kind_failures,
+      .compressed_mems = d->stats.compressed_mems,
+      .compression_fallbacks = d->stats.compression_fallbacks,
       .kind_alias_ready = d->kind_alias_ready,
       .foreign_waits = d->stats.foreign_waits,
       .segments_released = d->stats.segments_released,

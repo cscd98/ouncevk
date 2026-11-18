@@ -15,6 +15,10 @@
 #define MAP_PAGE_B UINT64_C(0x1000)
 #define MAP_SLOT_LIMIT 32
 #define MAP_KIND_ORDINARY 6
+/* dev_mmu.h: NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE (8) to
+ * NV_MMU_PTE_KIND_Z24S8_COMPRESSIBLE_DISABLE_PLC (0xe). */
+#define MAP_KIND_COMPRESSIBLE_FIRST 8
+#define MAP_KIND_COMPRESSIBLE_LAST 0xe
 /* One wait for a slot's completion. A wait that times out is repeated. */
 #define MAP_WAIT_SLICE_NS UINT64_C(1000000000)
 
@@ -378,19 +382,17 @@ nvkmd_nvgpu_native_map_unmap(struct nvkmd_nvgpu_native_map_owner *map,
 }
 
 /* Maps part of a registered backing at a GPU VA that the caller reserved
- * (worker raw 0xe3 with a backing offset). Kinds 1-6 are accepted. Waits
- * for the slot. */
-enum nvkmd_nvgpu_native_map_status
-nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
-                             struct nvkmd_nvgpu_native_backing *backing,
-                             uint64_t gpu_va, uint64_t backing_offset_B,
-                             uint64_t size_B, uint8_t kind,
-                             bool gpu_cacheable,
-                             struct nvkmd_nvgpu_native_slot *slot,
-                             Result *result_out)
+ * (worker raw 0xe3 with a backing offset), with a kind and the kind that the
+ * service maps when it cannot map the first. Waits for the slot. */
+static enum nvkmd_nvgpu_native_map_status
+map_range(struct nvkmd_nvgpu_native_runtime *runtime,
+          struct nvkmd_nvgpu_native_backing *backing,
+          uint64_t gpu_va, uint64_t backing_offset_B, uint64_t size_B,
+          uint8_t kind, uint8_t fallback_kind, bool gpu_cacheable,
+          struct nvkmd_nvgpu_native_slot *slot, uint8_t *selected_kind_out,
+          Result *result_out)
 {
    if (!runtime || !backing || !slot || !result_out || !gpu_va || !size_B ||
-       kind < 1 || kind > MAP_KIND_ORDINARY ||
        ((gpu_va | backing_offset_B | size_B) & (MAP_PAGE_B - 1)) ||
        backing_offset_B >= backing->length ||
        size_B > backing->length - backing_offset_B)
@@ -409,7 +411,7 @@ nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
       .range_id = backing->range_id,
       .range_offset = backing_offset_B,
       .kind = kind,
-      .fallback_kind = kind,
+      .fallback_kind = fallback_kind,
       .gpu_cacheable = gpu_cacheable,
       .client = runtime->vm.client,
    };
@@ -431,9 +433,67 @@ nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
    backing->maps++;
    if (outcome == NVKMD_NVGPU_NATIVE_SLOT_UNRESOLVED)
       return NVKMD_NVGPU_NATIVE_MAP_WAIT;
-   if (selected_kind != kind)
+   if (selected_kind != kind && selected_kind != fallback_kind)
       return NVKMD_NVGPU_NATIVE_MAP_KIND;
+   *selected_kind_out = selected_kind;
    return NVKMD_NVGPU_NATIVE_MAP_OK;
+}
+
+enum nvkmd_nvgpu_native_map_status
+nvkmd_nvgpu_native_map_range(struct nvkmd_nvgpu_native_runtime *runtime,
+                             struct nvkmd_nvgpu_native_backing *backing,
+                             uint64_t gpu_va, uint64_t backing_offset_B,
+                             uint64_t size_B, uint8_t kind,
+                             bool gpu_cacheable,
+                             struct nvkmd_nvgpu_native_slot *slot,
+                             Result *result_out)
+{
+   if (kind < 1 || kind > MAP_KIND_ORDINARY)
+      return NVKMD_NVGPU_NATIVE_MAP_ARGUMENT;
+   uint8_t selected_kind = 0;
+   return map_range(runtime, backing, gpu_va, backing_offset_B, size_B, kind,
+                    kind, gpu_cacheable, slot, &selected_kind, result_out);
+}
+
+bool
+nvkmd_nvgpu_native_kind_is_compressible(uint8_t kind)
+{
+   return kind >= MAP_KIND_COMPRESSIBLE_FIRST &&
+          kind <= MAP_KIND_COMPRESSIBLE_LAST;
+}
+
+uint8_t
+nvkmd_nvgpu_native_kind_fallback(uint8_t kind)
+{
+   static const uint8_t fallbacks[] = {
+      MAP_KIND_ORDINARY, /* 8, generic compressible */
+      MAP_KIND_ORDINARY, /* 9, generic compressible, PLC disabled */
+      2,                 /* 0xa, S8 compressible -> S8 */
+      1,                 /* 0xb, Z16 compressible -> Z16 */
+      3,                 /* 0xc, S8Z24 compressible -> S8Z24 */
+      4,                 /* 0xd, ZF32_X24S8 compressible -> ZF32_X24S8 */
+      5,                 /* 0xe, Z24S8 compressible -> Z24S8 */
+   };
+   if (!nvkmd_nvgpu_native_kind_is_compressible(kind))
+      return kind;
+   return fallbacks[kind - MAP_KIND_COMPRESSIBLE_FIRST];
+}
+
+enum nvkmd_nvgpu_native_map_status
+nvkmd_nvgpu_native_map_range_compressible(
+   struct nvkmd_nvgpu_native_runtime *runtime,
+   struct nvkmd_nvgpu_native_backing *backing,
+   uint64_t gpu_va, uint64_t backing_offset_B, uint64_t size_B,
+   uint8_t kind, bool gpu_cacheable,
+   struct nvkmd_nvgpu_native_slot *slot, uint8_t *selected_kind_out,
+   Result *result_out)
+{
+   if (!selected_kind_out || !nvkmd_nvgpu_native_kind_is_compressible(kind))
+      return NVKMD_NVGPU_NATIVE_MAP_ARGUMENT;
+   *selected_kind_out = 0;
+   return map_range(runtime, backing, gpu_va, backing_offset_B, size_B, kind,
+                    nvkmd_nvgpu_native_kind_fallback(kind), gpu_cacheable,
+                    slot, selected_kind_out, result_out);
 }
 
 /* Removes one mapping that nvkmd_nvgpu_native_map_range made (worker raw

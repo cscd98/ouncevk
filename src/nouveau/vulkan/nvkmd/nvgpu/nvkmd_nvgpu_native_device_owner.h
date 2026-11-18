@@ -68,6 +68,9 @@ struct nvkmd_nvgpu_native_submit_stats {
    /* Chunked memory: chunks registered and released, failures, chunked memory. */
    uint32_t chunks_registered, chunks_released, chunk_failures;
    uint32_t chunked_mems;
+   /* Compressed chunked memory, and requests that the service mapped with
+    * the ordinary fallback kind. */
+   uint32_t compressed_mems, compression_fallbacks;
    /* Of chunks_registered: those that the reserve registered ahead. */
    uint32_t chunks_prepared;
    /* Imported host pointers (nvkmd_nvgpu_native_host_mem.c), and failed
@@ -212,6 +215,10 @@ struct nvkmd_nvgpu_native_device_owner {
     * lock. */
    struct nvkmd_nvgpu_native_chunk *free_chunks;
    uint32_t free_chunk_count;
+   /* Free chunks that were mapped with a compressible kind. Only compressed
+    * memory uses them again (nvkmd_nvgpu_native_chunked.c). */
+   struct nvkmd_nvgpu_native_chunk *free_compressible_chunks;
+   uint32_t free_compressible_chunk_count;
    /* The number of free chunks that the reserve keeps ready
     * (nvkmd_nvgpu_native_chunk_reserve.h). 0 until an allocation had to
     * register a chunk. */
