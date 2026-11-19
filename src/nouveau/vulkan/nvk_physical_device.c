@@ -1491,6 +1491,10 @@ nvk_get_sysmem_heap_available(struct nvk_physical_device *pdev)
 /* For the bounded heap of a native backend, the backend reports the
  * available size.
  */
+/* Usage of the bounded native heap, shared by all instances (see
+ * nvk_memory_heap.shared_used). */
+static uint64_t nvk_bounded_heap_used;
+
 static uint64_t
 nvk_get_bounded_sysmem_heap_available(struct nvk_physical_device *pdev)
 {
@@ -2083,6 +2087,10 @@ nvk_physical_device_create(struct nvk_instance *instance,
    pdev->mem_heaps[sysmem_heap_idx] = (struct nvk_memory_heap) {
       .size = heap_size,
       .flags = 0,
+      /* The bounded native heap is the process's one GPU memory pool, and
+       * VK_EXT_memory_budget reports a process's usage: every instance's
+       * physical device counts into one counter. */
+      .shared_used = bounded_native ? &nvk_bounded_heap_used : NULL,
       .available = bounded_native ? nvk_get_bounded_sysmem_heap_available :
                                     nvk_get_sysmem_heap_available,
    };
@@ -2299,7 +2307,7 @@ nvk_GetPhysicalDeviceMemoryProperties2(
 
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct nvk_memory_heap *heap = &pdev->mem_heaps[i];
-            uint64_t used = p_atomic_read(&heap->used);
+            uint64_t used = nvk_memory_heap_used_B(heap);
 
             /* From the Vulkan 1.3.278 spec:
              *

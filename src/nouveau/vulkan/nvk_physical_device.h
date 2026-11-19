@@ -31,9 +31,27 @@ struct nvk_queue_family {
 struct nvk_memory_heap {
    uint64_t size;
    uint64_t used;
+   /* When not NULL, the heap's usage is counted here instead of in used: a
+    * counter that the physical devices of every instance in the process
+    * share, because they share the heap itself. */
+   uint64_t *shared_used;
    VkMemoryHeapFlags flags;
    uint64_t (*available)(struct nvk_physical_device *pdev);
 };
+
+/* The counter of the memory that the process has allocated from heap. */
+static inline uint64_t *
+nvk_memory_heap_used(struct nvk_memory_heap *heap)
+{
+   return heap->shared_used ? heap->shared_used : &heap->used;
+}
+
+/* The memory that the process has allocated from heap, in bytes. */
+static inline uint64_t
+nvk_memory_heap_used_B(const struct nvk_memory_heap *heap)
+{
+   return p_atomic_read(heap->shared_used ? heap->shared_used : &heap->used);
+}
 
 struct nvk_physical_device {
    struct vk_physical_device vk;
