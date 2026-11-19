@@ -1488,13 +1488,13 @@ nvk_get_sysmem_heap_available(struct nvk_physical_device *pdev)
    return ROUND_DOWN_TO(sysmem_size_B, 1 << 20);
 }
 
-/* For the bounded heap of a native backend, the backend reports the
- * available size.
- */
 /* Usage of the bounded native heap, shared by all instances (see
  * nvk_memory_heap.shared_used). */
 static uint64_t nvk_bounded_heap_used;
 
+/* For the bounded heap of a native backend, the backend reports the
+ * available size.
+ */
 static uint64_t
 nvk_get_bounded_sysmem_heap_available(struct nvk_physical_device *pdev)
 {
@@ -1958,6 +1958,73 @@ nvk_physical_device_create(struct nvk_instance *instance,
       NATIVE_EXTENSION(EXT_pipeline_creation_feedback);
       NATIVE_EXTENSION(EXT_zero_initialize_device_memory);
       NATIVE_FEATURE(zeroInitializeDeviceMemory);
+      /* Shader functionality that NAK and NVK implement without a native
+       * service: compute derivatives, barycentrics, explicit workgroup
+       * memory layout, 64-bit float and 16-bit float vector atomics, FMA,
+       * relaxed layouts and extended instructions, the old ballot and vote
+       * extensions, replicated composites, unsized uniform arrays and
+       * untyped pointers. Maximal reconvergence stays off: NAK fails 533 of
+       * 720 of its compute nesting cases. Quad control requires it.
+       */
+      NATIVE_EXTENSION(KHR_compute_shader_derivatives);
+      NATIVE_EXTENSION(NV_compute_shader_derivatives);
+      NATIVE_FEATURE(computeDerivativeGroupQuads);
+      NATIVE_FEATURE(computeDerivativeGroupLinear);
+      NATIVE_EXTENSION(KHR_fragment_shader_barycentric);
+      NATIVE_FEATURE(fragmentShaderBarycentric);
+      NATIVE_EXTENSION(KHR_workgroup_memory_explicit_layout);
+      NATIVE_FEATURE(workgroupMemoryExplicitLayout);
+      NATIVE_FEATURE(workgroupMemoryExplicitLayoutScalarBlockLayout);
+      NATIVE_FEATURE(workgroupMemoryExplicitLayout8BitAccess);
+      NATIVE_FEATURE(workgroupMemoryExplicitLayout16BitAccess);
+      NATIVE_FEATURE(shaderBufferFloat64Atomics);
+      NATIVE_FEATURE(shaderBufferFloat64AtomicAdd);
+      NATIVE_FEATURE(shaderSharedFloat64Atomics);
+      NATIVE_FEATURE(shaderSharedFloat64AtomicAdd);
+      NATIVE_EXTENSION(NV_shader_atomic_float16_vector);
+      NATIVE_FEATURE(shaderFloat16VectorAtomics);
+      NATIVE_EXTENSION(KHR_shader_fma);
+      NATIVE_FEATURE(shaderFmaFloat16);
+      NATIVE_FEATURE(shaderFmaFloat32);
+      NATIVE_FEATURE(shaderFmaFloat64);
+      NATIVE_EXTENSION(KHR_relaxed_block_layout);
+      NATIVE_EXTENSION(KHR_shader_relaxed_extended_instruction);
+      NATIVE_FEATURE(shaderRelaxedExtendedInstruction);
+      NATIVE_EXTENSION(EXT_shader_subgroup_ballot);
+      NATIVE_EXTENSION(EXT_shader_subgroup_vote);
+      NATIVE_EXTENSION(EXT_shader_replicated_composites);
+      NATIVE_FEATURE(shaderReplicatedComposites);
+      NATIVE_EXTENSION(EXT_shader_uniform_buffer_unsized_array);
+      NATIVE_FEATURE(shaderUniformBufferUnsizedArray);
+      NATIVE_EXTENSION(KHR_shader_untyped_pointers);
+      NATIVE_FEATURE(shaderUntypedPointers);
+      /* Command and state functionality: the rest of extended dynamic
+       * state 3, maintenance 8 to 10, load and store op none, legacy
+       * vertex attributes, nested command buffers, texel buffer alignment,
+       * a zero instance-rate divisor and the provoking vertex in transform
+       * feedback.
+       */
+      NATIVE_FEATURE(extendedDynamicState3AlphaToCoverageEnable);
+      NATIVE_FEATURE(extendedDynamicState3AlphaToOneEnable);
+      NATIVE_FEATURE(extendedDynamicState3RasterizationSamples);
+      NATIVE_FEATURE(extendedDynamicState3SampleLocationsEnable);
+      NATIVE_FEATURE(extendedDynamicState3SampleMask);
+      NATIVE_EXTENSION(KHR_maintenance8);
+      NATIVE_FEATURE(maintenance8);
+      NATIVE_EXTENSION(KHR_maintenance9);
+      NATIVE_FEATURE(maintenance9);
+      NATIVE_EXTENSION(KHR_maintenance10);
+      NATIVE_FEATURE(maintenance10);
+      NATIVE_EXTENSION(EXT_load_store_op_none);
+      NATIVE_EXTENSION(EXT_legacy_vertex_attributes);
+      NATIVE_FEATURE(legacyVertexAttributes);
+      NATIVE_EXTENSION(EXT_nested_command_buffer);
+      NATIVE_FEATURE(nestedCommandBuffer);
+      NATIVE_FEATURE(nestedCommandBufferRendering);
+      NATIVE_FEATURE(nestedCommandBufferSimultaneousUse);
+      NATIVE_FEATURE(texelBufferAlignment);
+      NATIVE_FEATURE(vertexAttributeInstanceRateZeroDivisor);
+      NATIVE_FEATURE(transformFeedbackPreservesProvokingVertex);
       NATIVE_EXTENSION(EXT_conservative_rasterization);
       NATIVE_EXTENSION(EXT_sample_locations);
       NATIVE_EXTENSION(EXT_shader_module_identifier);
