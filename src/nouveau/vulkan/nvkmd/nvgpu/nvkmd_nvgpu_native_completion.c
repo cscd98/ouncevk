@@ -53,12 +53,19 @@ nvkmd_nvgpu_native_completion_read_counter(
                              NULL);
 }
 
+static Result
+channel_notification_read(uint32_t gpu_fd,
+                          struct channel_notification *notification)
+{
+   memset(notification, 0, sizeof(*notification));
+   return nvIoctl(gpu_fd, CHANNEL_HEALTH_IOCTL, notification);
+}
+
 Result
 nvkmd_nvgpu_native_channel_health(uint32_t gpu_fd, uint16_t *status)
 {
    struct channel_notification notification;
-   memset(&notification, 0, sizeof(notification));
-   const Result rc = nvIoctl(gpu_fd, CHANNEL_HEALTH_IOCTL, &notification);
+   const Result rc = channel_notification_read(gpu_fd, &notification);
    if (R_SUCCEEDED(rc) && status)
       *status = notification.status;
    return rc;
@@ -159,9 +166,13 @@ completion_join(struct nvkmd_nvgpu_native_completion *completion,
    __asm__ volatile("dsb sy" ::: "memory");
    const bool verified = io->verify(io->context);
 
-   uint16_t health = UINT16_MAX;
-   if (R_FAILED(nvkmd_nvgpu_native_channel_health(endpoint->gpu_fd, &health)))
+   struct channel_notification notification;
+   if (R_FAILED(channel_notification_read(endpoint->gpu_fd, &notification)))
       return NVKMD_NVGPU_COMPLETION_HEALTH;
+   const uint16_t health = notification.status;
+   completion->health_info32 = notification.info32;
+   completion->health_info16 = notification.info16;
+   completion->health_status = health;
 
    completion->complete = verified && !health;
    if (completion->complete)

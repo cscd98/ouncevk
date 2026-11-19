@@ -476,10 +476,13 @@ native_owner_join_first_mode(struct nvkmd_nvgpu_native_device_owner *owner,
       return VK_NOT_READY;
    if (status != NVKMD_NVGPU_COMPLETION_OK) {
       mesa_loge("native: completion join failed: status %u, blocking %u, "
-                "producer %u, baseline %u, target %u",
+                "producer %u, baseline %u, target %u, channel error 0x%x "
+                "detail 0x%x status 0x%x",
                 (unsigned)status, (unsigned)block,
                 point->completion.producer_id, point->completion.baseline_low,
-                point->completion.target);
+                point->completion.target, point->completion.health_info32,
+                (unsigned)point->completion.health_info16,
+                (unsigned)point->completion.health_status);
       return native_owner_fail(owner);
    }
    if (nvkmd_nvgpu_native_arena_release(

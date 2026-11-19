@@ -45,6 +45,12 @@ struct nvkmd_nvgpu_native_completion {
    uint32_t baseline_low;
    uint32_t target;
    bool begun, attempted, complete;
+   /* The channel's error notification at the last join that reached the
+    * target: the error code, its detail and the status (0 when healthy). A
+    * failed join logs them. */
+   uint32_t health_info32;
+   uint16_t health_info16;
+   uint16_t health_status;
 };
 
 /* Begin with a fresh baseline read of the producer counter. */
