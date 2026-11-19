@@ -1925,6 +1925,39 @@ nvk_physical_device_create(struct nvk_instance *instance,
       properties.primitiveFragmentShadingRateWithMultipleViewports = false;
       properties.layeredShadingRateAttachments = false;
       properties.fragmentShadingRateNonTrivialCombinerOps = false;
+      /* API and format functionality that NVK implements without a native
+       * service: the memory budget; the depth clip, primitive restart,
+       * generated-primitive query and 2D-view-of-3D functionality that Zink
+       * uses; and the mutable descriptors, image view minimum LOD, sliced
+       * 3D views, 16-bit 4444 formats, pipeline creation feedback and
+       * zero-initialized memory that the D3D layers use.
+       */
+      NATIVE_EXTENSION(EXT_memory_budget);
+      NATIVE_EXTENSION(EXT_depth_clip_control);
+      NATIVE_FEATURE(depthClipControl);
+      NATIVE_EXTENSION(EXT_primitive_topology_list_restart);
+      NATIVE_FEATURE(primitiveTopologyListRestart);
+      NATIVE_FEATURE(primitiveTopologyPatchListRestart);
+      NATIVE_EXTENSION(EXT_primitives_generated_query);
+      NATIVE_FEATURE(primitivesGeneratedQuery);
+      NATIVE_FEATURE(primitivesGeneratedQueryWithRasterizerDiscard);
+      NATIVE_FEATURE(primitivesGeneratedQueryWithNonZeroStreams);
+      NATIVE_EXTENSION(EXT_image_2d_view_of_3d);
+      NATIVE_FEATURE(image2DViewOf3D);
+      NATIVE_FEATURE(sampler2DViewOf3D);
+      NATIVE_EXTENSION(EXT_mutable_descriptor_type);
+      NATIVE_EXTENSION(VALVE_mutable_descriptor_type);
+      NATIVE_FEATURE(mutableDescriptorType);
+      NATIVE_EXTENSION(EXT_image_view_min_lod);
+      NATIVE_FEATURE(minLod);
+      NATIVE_EXTENSION(EXT_image_sliced_view_of_3d);
+      NATIVE_FEATURE(imageSlicedViewOf3D);
+      NATIVE_EXTENSION(EXT_4444_formats);
+      NATIVE_FEATURE(formatA4R4G4B4);
+      NATIVE_FEATURE(formatA4B4G4R4);
+      NATIVE_EXTENSION(EXT_pipeline_creation_feedback);
+      NATIVE_EXTENSION(EXT_zero_initialize_device_memory);
+      NATIVE_FEATURE(zeroInitializeDeviceMemory);
       NATIVE_EXTENSION(EXT_conservative_rasterization);
       NATIVE_EXTENSION(EXT_sample_locations);
       NATIVE_EXTENSION(EXT_shader_module_identifier);
