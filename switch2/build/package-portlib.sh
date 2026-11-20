@@ -19,6 +19,12 @@
 #   libraries of the same name, which do not work on Switch 2, and they let
 #   the link succeed when devkitPro's switch-mesa is not installed.
 # - include/: the Vulkan, EGL, OpenGL and OpenGL ES headers.
+# - lib/shared/: the Vulkan library as a shared library, when OUNCE_NX names
+#   a libounce that has its runtime library built (make shared in its nx/):
+#   libouncevk.so.1, which a dynamically linked program links (libvulkan.so
+#   and libouncevk.so are linker scripts for -lvulkan and -louncevk), and
+#   nro/libouncevk.so.1, which goes on the SD card beside libounce.so.1 and
+#   libstdc++.so.6. Put lib/shared before lib in the library path.
 # - lib/pkgconfig/: vulkan, egl, glesv2, gl and glapi.
 # - bin/aarch64-none-elf-pkg-config: pkg-config for Switch 2.
 # - share/licenses/ouncevk/: the license texts.
@@ -27,7 +33,9 @@
 # dispatch tables refer to the driver entry points with weak references, and
 # a weak reference does not pull a member out of an archive. In one object,
 # all entry points come in together. Only the API symbols stay global, so the
-# Mesa symbols cannot collide with the symbols of a program.
+# Mesa symbols cannot collide with the symbols of a program. The API is the
+# Vulkan, EGL and GL functions, the driver's entry points for a Vulkan loader
+# (vk_icd*), the profile functions and libounce's exit hook.
 
 set -eu
 
@@ -143,6 +151,26 @@ prelink() {
     "$PREFIX-objcopy" --wildcard $keep "$output"
 }
 
+# Links the relocatable object as a shared library on libounce.so and
+# libstdc++.so, and makes its NRO. The object's global symbols, the API, are
+# what the library exports. Its own references to them bind to itself. The
+# link fails when the object needs a symbol that those libraries do not
+# have: a driver cannot need one from the program.
+#   shared_library OBJECT SONAME
+shared_library() {
+    "$PREFIX-gcc" -mcpu=cortex-a78c+crypto -mtp=soft -fPIC -shared \
+        -nostdlib -nostartfiles -Wl,-T,"$OUNCE_NX/switch.ld" \
+        -Wl,-soname,"$2" -Wl,-Bsymbolic -Wl,--gc-sections -Wl,-z,defs \
+        -Wl,-z,text -Wl,-z,now -Wl,-z,pack-relative-relocs \
+        -Wl,--build-id=sha1 -Wl,--hash-style=gnu -Wl,--eh-frame-hdr \
+        "$OUNCE_NX/lib/ounce_module_crt0.o" "$1" \
+        "$OUNCE_NX/lib/shared/libstdc++.so.6" \
+        "$OUNCE_NX/lib/shared/libounce.so.1" -lgcc \
+        -o "$DEST/lib/shared/$2"
+    /opt/devkitpro/tools/bin/elf2nro "$DEST/lib/shared/$2" \
+        "$DEST/lib/shared/nro/$2" > /dev/null
+}
+
 # Makes an archive with the one object in it.
 #   archive LIBRARY OBJECT
 archive() {
@@ -184,14 +212,27 @@ mkdir -p "$DEST/lib/pkgconfig" "$DEST/include" "$DEST/bin" \
 
 # Libraries.
 prelink "$WORK/vulkan.o" "$VULKAN_BUILD" "" \
-    'vk[A-Z]*' 'ouncevk_profile_*' '__nx_gpu_exit'
+    'vk[A-Z]*' 'vk_icd*' 'ouncevk_profile_*' '__nx_gpu_exit'
 archive "$DEST/lib/libouncevk.a" "$WORK/vulkan.o"
 echo 'INPUT(-louncevk -lstdc++ -lm)' > "$DEST/lib/libvulkan.a"
 
 prelink "$WORK/egl.o" "$GL_BUILD" "$GL_ARCHIVES" \
-    'vk[A-Z]*' 'egl[A-Z]*' 'gl[A-Z]*' 'ouncevk_profile_*' '__nx_gpu_exit'
+    'vk[A-Z]*' 'vk_icd*' 'egl[A-Z]*' 'gl[A-Z]*' 'ouncevk_profile_*' \
+    '__nx_gpu_exit'
 archive "$DEST/lib/libouncevk-gl.a" "$WORK/egl.o"
 echo 'INPUT(-louncevk-gl -lstdc++ -lm)' > "$DEST/lib/libEGL.a"
+
+# The shared Vulkan library.
+OUNCE_NX="${OUNCE_NX:-}"
+if [ -n "$OUNCE_NX" ] && [ -f "$OUNCE_NX/lib/shared/libounce.so.1" ]; then
+    mkdir -p "$DEST/lib/shared/nro"
+    shared_library "$WORK/vulkan.o" libouncevk.so.1
+    echo 'INPUT(libouncevk.so.1)' > "$DEST/lib/shared/libouncevk.so"
+    echo 'INPUT(libouncevk.so.1)' > "$DEST/lib/shared/libvulkan.so"
+    echo "libouncevk.so.1 is in $DEST/lib/shared"
+else
+    echo "No shared library: OUNCE_NX names no libounce with libounce.so.1"
+fi
 
 empty_archive "$DEST/lib/libGLESv2.a"
 empty_archive "$DEST/lib/libglapi.a"

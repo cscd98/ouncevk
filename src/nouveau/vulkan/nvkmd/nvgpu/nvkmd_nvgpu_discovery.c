@@ -336,8 +336,10 @@ nvkmd_nvgpu_native_shutdown(void)
  * heap. */
 static uint32_t native_exit_status;
 
-void __nx_gpu_exit(void);
-void
+/* PUBLIC: libounce-nx finds the hook by its name, also when this driver is a
+ * shared library. */
+PUBLIC void __nx_gpu_exit(void);
+PUBLIC void
 __nx_gpu_exit(void)
 {
    if (!native_runtime_attempted && !native_device.attempted)
@@ -524,7 +526,9 @@ native_profile_bucket(uint64_t us)
    return bucket;
 }
 
-void
+/* The functions of include/ouncevk/profile.h are PUBLIC: a program calls
+ * them, also when this driver is a shared library. */
+PUBLIC void
 ouncevk_profile_record(enum ouncevk_profile_timer timer, uint64_t ticks)
 {
    struct nvkmd_nvgpu_native_device_owner *d = &native_device;
@@ -546,13 +550,13 @@ ouncevk_profile_record(enum ouncevk_profile_timer timer, uint64_t ticks)
    nvkmd_nvgpu_native_owner_unlock(d);
 }
 
-void
+PUBLIC void
 ouncevk_profile_record_ns(enum ouncevk_profile_timer timer, uint64_t ns)
 {
    ouncevk_profile_record(timer, armNsToTicks(ns));
 }
 
-bool
+PUBLIC bool
 ouncevk_profile_read(struct ouncevk_profile *out, bool reset)
 {
    struct nvkmd_nvgpu_native_device_owner *d = &native_device;
@@ -579,7 +583,7 @@ ouncevk_profile_read(struct ouncevk_profile *out, bool reset)
    return true;
 }
 
-const char *
+PUBLIC const char *
 ouncevk_profile_timer_name(enum ouncevk_profile_timer timer)
 {
    switch (timer) {
