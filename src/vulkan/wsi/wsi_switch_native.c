@@ -785,6 +785,9 @@ native_destroy(struct wsi_swapchain *base, const VkAllocationCallbacks *alloc)
    struct native_chain *chain = (struct native_chain *)base;
    struct wsi_native_vi_window *window = chain->window;
    native_mailbox_stop(chain);
+   for (unsigned i = 0; i < NATIVE_IMAGE_COUNT; i++)
+      chain->images[i].acquired = false;
+   chain->reserved = 0;
    /* A swapchain that an oldSwapchain handover retired gave the window to
     * the new swapchain. If its images are still on the layer, it stays in
     * the handover list and is freed when it leaves it. */
