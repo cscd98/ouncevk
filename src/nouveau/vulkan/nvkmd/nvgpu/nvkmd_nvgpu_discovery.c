@@ -81,7 +81,10 @@ default_platform_borrow_cpu(void *context, uint64_t *base, uint64_t *extent_B)
    return 0;
 }
 
-bool
+/* The default platform's two functions are PUBLIC: the EGL driver calls them,
+ * and in the shared libraries it is in another library than this driver.
+ */
+PUBLIC bool
 nvkmd_nvgpu_native_acquire_default_platform(void)
 {
    if (native_platform.registered)
@@ -103,7 +106,7 @@ nvkmd_nvgpu_native_acquire_default_platform(void)
    return true;
 }
 
-uint32_t
+PUBLIC uint32_t
 nvkmd_nvgpu_native_release_default_platform(void)
 {
    if (!default_platform_span)

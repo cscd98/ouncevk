@@ -19,12 +19,19 @@
 #   libraries of the same name, which do not work on Switch 2, and they let
 #   the link succeed when devkitPro's switch-mesa is not installed.
 # - include/: the Vulkan, EGL, OpenGL and OpenGL ES headers.
-# - lib/shared/: the Vulkan library as a shared library, when OUNCE_NX names
-#   a libounce that has its runtime library built (make shared in its nx/):
-#   libouncevk.so.1, which a dynamically linked program links (libvulkan.so
-#   and libouncevk.so are linker scripts for -lvulkan and -louncevk), and
-#   nro/libouncevk.so.1, which goes on the SD card beside libounce.so.1 and
-#   libstdc++.so.6. Put lib/shared before lib in the library path.
+# - lib/shared/: the libraries as shared libraries, when OUNCE_NX names a
+#   libounce that has its runtime library built (make shared in its nx/).
+#   Put lib/shared before lib in the library path.
+#   - libouncevk.so.1: Vulkan (NVK), the driver.
+#   - libouncevk-gl.so.1: EGL, OpenGL and OpenGL ES (Zink). It has no driver
+#     of its own: it needs libouncevk.so.1.
+#   - libvulkan.so, libouncevk.so, libEGL.so, libGLESv2.so, libGL.so: linker
+#     scripts, for -lvulkan, -louncevk, -lEGL, -lGLESv2 and -lGL.
+#   - libvulkan.so.1, libEGL.so.1, libGLESv2.so.2, libGL.so.1: the names that
+#     a program for Linux loads with dlopen. Each is a library with no code
+#     that needs the one above, so dlsym on its handle finds the functions.
+#   - nro/: all of those as NROs, which go on the SD card beside
+#     libounce.so.1 and libstdc++.so.6.
 # - lib/pkgconfig/: vulkan, egl, glesv2, gl and glapi.
 # - bin/aarch64-none-elf-pkg-config: pkg-config for Switch 2.
 # - share/licenses/ouncevk/: the license texts.
@@ -35,7 +42,9 @@
 # all entry points come in together. Only the API symbols stay global, so the
 # Mesa symbols cannot collide with the symbols of a program. The API is the
 # Vulkan, EGL and GL functions, the driver's entry points for a Vulkan loader
-# (vk_icd*), the profile functions and libounce's exit hook.
+# (vk_icd*), the profile functions and libounce's exit hook. The Vulkan
+# object also keeps the two functions that the EGL driver calls to register
+# the GPU platform: the shared GL library takes them from the shared driver.
 
 set -eu
 
@@ -111,13 +120,19 @@ nvk_objects() {
 }
 
 # Makes one relocatable object and keeps only the symbols that match the
-# given patterns global.
-#   prelink OUTPUT BUILD WHOLE_ARCHIVES PATTERN...
+# given patterns global. DRIVER is "driver" for an object that holds NVK, and
+# "no-driver" for one that takes Vulkan from another library: it then holds
+# only the members of DRIVER_ARCHIVES that its own code needs.
+#   prelink OUTPUT BUILD WHOLE_ARCHIVES DRIVER PATTERN...
 prelink() {
     output="$1"
     build="$2"
     whole="$3"
-    shift 3
+    driver_objects=""
+    if [ "$4" = driver ]; then
+        driver_objects="$(nvk_objects "$build")"
+    fi
+    shift 4
 
     archives=""
     for archive in $DRIVER_ARCHIVES; do
@@ -137,7 +152,7 @@ prelink() {
     # template instantiation can discard this object's local definition.
     "$PREFIX-ld" -r --force-group-allocation -o "$output" \
         --whole-archive $whole_archives --no-whole-archive \
-        $(nvk_objects "$build") \
+        $driver_objects \
         --start-group $archives "$ZLIB_ARCHIVE" --end-group
 
     keep=""
@@ -155,20 +170,47 @@ prelink() {
 # libstdc++.so, and makes its NRO. The object's global symbols, the API, are
 # what the library exports. Its own references to them bind to itself. The
 # link fails when the object needs a symbol that those libraries do not
-# have: a driver cannot need one from the program.
-#   shared_library OBJECT SONAME
+# have: a driver cannot need one from the program. NEEDED names the shared
+# libraries of this package that the object also takes symbols from.
+#   shared_library OBJECT SONAME [NEEDED...]
 shared_library() {
+    object="$1"
+    soname="$2"
+    shift 2
+    needed=""
+    for library in "$@"; do
+        needed="$needed $DEST/lib/shared/$library"
+    done
+    # shellcheck disable=SC2086
     "$PREFIX-gcc" -mcpu=cortex-a78c+crypto -mtp=soft -fPIC -shared \
         -nostdlib -nostartfiles -Wl,-T,"$OUNCE_NX/switch.ld" \
-        -Wl,-soname,"$2" -Wl,-Bsymbolic -Wl,--gc-sections -Wl,-z,defs \
+        -Wl,-soname,"$soname" -Wl,-Bsymbolic -Wl,--gc-sections -Wl,-z,defs \
         -Wl,-z,text -Wl,-z,now -Wl,-z,pack-relative-relocs \
         -Wl,--build-id=sha1 -Wl,--hash-style=gnu -Wl,--eh-frame-hdr \
-        "$OUNCE_NX/lib/ounce_module_crt0.o" "$1" \
+        "$OUNCE_NX/lib/ounce_module_crt0.o" "$object" $needed \
         "$OUNCE_NX/lib/shared/libstdc++.so.6" \
         "$OUNCE_NX/lib/shared/libounce.so.1" -lgcc \
-        -o "$DEST/lib/shared/$2"
-    /opt/devkitpro/tools/bin/elf2nro "$DEST/lib/shared/$2" \
-        "$DEST/lib/shared/nro/$2" > /dev/null
+        -o "$DEST/lib/shared/$soname"
+    /opt/devkitpro/tools/bin/elf2nro "$DEST/lib/shared/$soname" \
+        "$DEST/lib/shared/nro/$soname" > /dev/null
+}
+
+# Makes a shared library with no code that needs the library TARGET, and its
+# NRO. A program that loads SONAME with dlopen gets a handle whose dlsym
+# looks in TARGET and in what TARGET needs. This is for the names that code
+# written for Linux loads: the SD card's file system has no links to give a
+# library two names.
+#   alias_library SONAME TARGET
+alias_library() {
+    "$PREFIX-gcc" -mcpu=cortex-a78c+crypto -mtp=soft -fPIC -shared \
+        -nostdlib -nostartfiles -Wl,-T,"$OUNCE_NX/switch.ld" \
+        -Wl,-soname,"$1" -Wl,-z,now -Wl,--build-id=sha1 \
+        -Wl,--hash-style=gnu -Wl,--eh-frame-hdr \
+        "$OUNCE_NX/lib/ounce_module_crt0.o" \
+        -Wl,--no-as-needed "$DEST/lib/shared/$2" \
+        -o "$DEST/lib/shared/$1"
+    /opt/devkitpro/tools/bin/elf2nro "$DEST/lib/shared/$1" \
+        "$DEST/lib/shared/nro/$1" > /dev/null
 }
 
 # Makes an archive with the one object in it.
@@ -211,25 +253,45 @@ mkdir -p "$DEST/lib/pkgconfig" "$DEST/include" "$DEST/bin" \
     "$DEST/share/licenses/ouncevk"
 
 # Libraries.
-prelink "$WORK/vulkan.o" "$VULKAN_BUILD" "" \
-    'vk[A-Z]*' 'vk_icd*' 'ouncevk_profile_*' '__nx_gpu_exit'
+prelink "$WORK/vulkan.o" "$VULKAN_BUILD" "" driver \
+    'vk[A-Z]*' 'vk_icd*' 'ouncevk_profile_*' '__nx_gpu_exit' \
+    'nvkmd_nvgpu_native_*_default_platform'
 archive "$DEST/lib/libouncevk.a" "$WORK/vulkan.o"
 echo 'INPUT(-louncevk -lstdc++ -lm)' > "$DEST/lib/libvulkan.a"
 
-prelink "$WORK/egl.o" "$GL_BUILD" "$GL_ARCHIVES" \
+prelink "$WORK/egl.o" "$GL_BUILD" "$GL_ARCHIVES" driver \
     'vk[A-Z]*' 'vk_icd*' 'egl[A-Z]*' 'gl[A-Z]*' 'ouncevk_profile_*' \
     '__nx_gpu_exit'
 archive "$DEST/lib/libouncevk-gl.a" "$WORK/egl.o"
 echo 'INPUT(-louncevk-gl -lstdc++ -lm)' > "$DEST/lib/libEGL.a"
 
-# The shared Vulkan library.
+# The shared libraries. The GL library is the GL frontend and Zink without
+# NVK: Zink gets the driver's functions from vk_icdGetInstanceProcAddr, which
+# libouncevk.so.1 exports, so a process has one driver whichever of the two
+# libraries its modules use.
 OUNCE_NX="${OUNCE_NX:-}"
 if [ -n "$OUNCE_NX" ] && [ -f "$OUNCE_NX/lib/shared/libounce.so.1" ]; then
     mkdir -p "$DEST/lib/shared/nro"
     shared_library "$WORK/vulkan.o" libouncevk.so.1
     echo 'INPUT(libouncevk.so.1)' > "$DEST/lib/shared/libouncevk.so"
     echo 'INPUT(libouncevk.so.1)' > "$DEST/lib/shared/libvulkan.so"
-    echo "libouncevk.so.1 is in $DEST/lib/shared"
+
+    prelink "$WORK/gl.o" "$GL_BUILD" "$GL_ARCHIVES" no-driver \
+        'egl[A-Z]*' 'gl[A-Z]*'
+    shared_library "$WORK/gl.o" libouncevk-gl.so.1 libouncevk.so.1
+    # The scripts also name the driver, which the GL library needs: the
+    # linker then finds it without -rpath-link. A program that calls no
+    # Vulkan function itself does not get it as a needed library.
+    for name in EGL GLESv2 GL; do
+        echo 'INPUT(libouncevk-gl.so.1 AS_NEEDED(libouncevk.so.1))' \
+            > "$DEST/lib/shared/lib$name.so"
+    done
+
+    alias_library libvulkan.so.1 libouncevk.so.1
+    alias_library libEGL.so.1 libouncevk-gl.so.1
+    alias_library libGLESv2.so.2 libouncevk-gl.so.1
+    alias_library libGL.so.1 libouncevk-gl.so.1
+    echo "The shared libraries are in $DEST/lib/shared"
 else
     echo "No shared library: OUNCE_NX names no libounce with libounce.so.1"
 fi
