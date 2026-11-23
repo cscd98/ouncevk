@@ -102,6 +102,12 @@ OVERLAY_LIBPATHS := $(SWITCH2_SHARED_LIBPATHS) $(OVERLAY_LIBPATHS)
 LIBS    := -lvulkan        # or: -lEGL -lGLESv2
 ```
 
+A CMake project gets the same with `-DOUNCE_SHARED=ON` on libounce's
+toolchain (`aarch64-none-elf-cmake`), and a Meson or autotools project with
+`OUNCE_SHARED=1` exported before `switch2vars.sh` is sourced.
+`aarch64-none-elf-pkg-config` then answers from `lib/shared/pkgconfig`, so
+`vulkan`, `egl`, `glesv2` and `gl` name the shared libraries.
+
 The NROs that the program needs go on the SD card with libounce's
 `libounce.so.1` and `libstdc++.so.6`: in the program's folder, or in
 `sdmc:/kaihen/lib` for all programs. A program that loads a library by a

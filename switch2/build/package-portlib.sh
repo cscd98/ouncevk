@@ -227,22 +227,38 @@ empty_archive() {
 
 # Writes a pkg-config file. The prefix comes from the location of the file,
 # so the tree can go into any devkitPro directory.
+#   pkgconfig_file FILE PREFIX LIBDIR NAME DESCRIPTION LIBS [REQUIRES]
+pkgconfig_file() {
+    {
+        echo "prefix=$2"
+        echo 'includedir=${prefix}/include'
+        echo "libdir=$3"
+        echo
+        echo "Name: $4"
+        echo "Description: $5"
+        echo "Version: $VERSION"
+        if [ -n "${7:-}" ]; then
+            echo "Requires: $7"
+        fi
+        echo "Libs: -L\${libdir} $6"
+        echo 'Cflags: -I${includedir} -D__SWITCH2__'
+    } > "$1"
+}
+
+# The pkg-config file of a static library, in lib/pkgconfig.
 #   pkgconfig NAME DESCRIPTION LIBS [REQUIRES]
 pkgconfig() {
-    {
-        echo 'prefix=${pcfiledir}/../..'
-        echo 'includedir=${prefix}/include'
-        echo 'libdir=${prefix}/lib'
-        echo
-        echo "Name: $1"
-        echo "Description: $2"
-        echo "Version: $VERSION"
-        if [ -n "${4:-}" ]; then
-            echo "Requires: $4"
-        fi
-        echo "Libs: -L\${libdir} $3"
-        echo 'Cflags: -I${includedir} -D__SWITCH2__'
-    } > "$DEST/lib/pkgconfig/$1.pc"
+    pkgconfig_file "$DEST/lib/pkgconfig/$1.pc" '${pcfiledir}/../..' \
+        '${prefix}/lib' "$@"
+}
+
+# The pkg-config file of a shared library, in lib/shared/pkgconfig. It names
+# lib/shared as the library's folder. aarch64-none-elf-pkg-config looks there
+# first for a dynamically linked program.
+#   pkgconfig_shared NAME DESCRIPTION LIBS [REQUIRES]
+pkgconfig_shared() {
+    pkgconfig_file "$DEST/lib/shared/pkgconfig/$1.pc" \
+        '${pcfiledir}/../../..' '${prefix}/lib/shared' "$@"
 }
 
 VERSION="$(sed -n '1p' "$SRC/VERSION")"
@@ -291,6 +307,13 @@ if [ -n "$OUNCE_NX" ] && [ -f "$OUNCE_NX/lib/shared/libounce.so.1" ]; then
     alias_library libEGL.so.1 libouncevk-gl.so.1
     alias_library libGLESv2.so.2 libouncevk-gl.so.1
     alias_library libGL.so.1 libouncevk-gl.so.1
+
+    mkdir -p "$DEST/lib/shared/pkgconfig"
+    pkgconfig_shared vulkan "Vulkan for Switch 2 (OunceVK)" "-lvulkan"
+    pkgconfig_shared egl "EGL for Switch 2 (OunceVK and Zink)" "-lEGL"
+    pkgconfig_shared glesv2 "OpenGL ES for Switch 2 (OunceVK and Zink)" \
+        "-lGLESv2" egl
+    pkgconfig_shared gl "OpenGL for Switch 2 (OunceVK and Zink)" "-lGL" egl
     echo "The shared libraries are in $DEST/lib/shared"
 else
     echo "No shared library: OUNCE_NX names no libounce with libounce.so.1"
@@ -319,7 +342,9 @@ pkgconfig glapi "Empty: the GL dispatch is in libEGL" ""
 pkgconfig libdrm_nouveau "Empty: Switch 2 does not use libdrm" ""
 
 # pkg-config for Switch 2. It looks in the Switch 2 portlibs first, then in
-# the Switch 1 portlibs.
+# the Switch 1 portlibs. For a dynamically linked program (OUNCE_SHARED set,
+# as libounce's CMake toolchain and switch2vars.sh do), the shared libraries
+# of the Switch 2 portlibs come before all of them.
 cat > "$DEST/bin/aarch64-none-elf-pkg-config" <<'EOF'
 #!/usr/bin/env bash
 # pkg-config for Switch 2 portlibs.
@@ -333,6 +358,9 @@ export PKG_CONFIG_DIR=
 export PKG_CONFIG_PATH=
 export PKG_CONFIG_SYSROOT_DIR=
 export PKG_CONFIG_LIBDIR="${DEVKITPRO}/portlibs/switch2/lib/pkgconfig:${DEVKITPRO}/portlibs/switch/lib/pkgconfig"
+if [[ -n "${OUNCE_SHARED:-}" ]]; then
+    PKG_CONFIG_LIBDIR="${DEVKITPRO}/portlibs/switch2/lib/shared/pkgconfig:${PKG_CONFIG_LIBDIR}"
+fi
 
 [[ "$1" == '--version' ]] && exec pkg-config --version
 exec pkg-config --static "$@"
