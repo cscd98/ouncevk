@@ -11,7 +11,7 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 
 ARG VERSION
 # The libounce release that OunceVK builds against.
-ARG LIBOUNCE_VERSION=20261117
+ARG LIBOUNCE_VERSION=20261123
 # The commit time, so that the package's file times do not depend on the
 # build.
 ARG SOURCE_DATE_EPOCH=0
@@ -35,11 +35,14 @@ RUN release="https://github.com/ouncebrew/libounce/releases/download/$LIBOUNCE_V
 
 # OunceVK's build scripts take libounce's headers and libraries from
 # /ounce-nx, laid out as libounce's nx/ folder. The package installs both
-# header folders as one.
+# header folders as one. The shared Vulkan library is linked with libounce's
+# linker script and against lib/shared/libounce.so.1.
 RUN mkdir -p /ounce-nx/external/bsd && \
     ln -s /opt/devkitpro/libounce/include /ounce-nx/include && \
     ln -s /opt/devkitpro/libounce/include /ounce-nx/external/bsd/include && \
-    ln -s /opt/devkitpro/libounce/lib /ounce-nx/lib
+    ln -s /opt/devkitpro/libounce/lib /ounce-nx/lib && \
+    ln -s /opt/devkitpro/libounce/switch.ld /ounce-nx/switch.ld && \
+    test -f /ounce-nx/lib/shared/libounce.so.1
 
 # makepkg does not run as root. OunceVK builds in /work.
 RUN useradd --create-home builder && \
