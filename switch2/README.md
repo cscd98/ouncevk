@@ -74,6 +74,48 @@ Each library is one relocatable object. Only the API symbols are global:
 `vk*`, `egl*`, `gl*` and the libounce exit hook. Mesa's other symbols are
 local, so they cannot collide with the symbols of a program.
 
+### Shared libraries
+
+When `OUNCE_NX` names a libounce with `libounce.so` (libounce's package has
+it), the tree also has `lib/shared`, for dynamically linked programs:
+
+- `libouncevk.so.1`: Vulkan, the driver.
+- `libouncevk-gl.so.1`: EGL, OpenGL and OpenGL ES. It has no driver of its
+  own and needs `libouncevk.so.1`, so a process has one driver whichever
+  of the two its modules use.
+- `libvulkan.so`, `libEGL.so`, `libGLESv2.so` and `libGL.so`: linker scripts,
+  so that `-lvulkan`, `-lEGL`, `-lGLESv2` and `-lGL` link the two libraries
+  above.
+- `libvulkan.so.1`, `libEGL.so.1`, `libGLESv2.so.2` and `libGL.so.1`: the
+  names that code written for Linux loads with `dlopen`. Each is a library
+  with no code that needs the real one, so `dlsym` on its handle finds the
+  functions.
+- `nro/`: all of those as NROs.
+
+A program links them as on Linux, with libounce's flags for a dynamically
+linked program, which put `lib/shared` before `lib` in the library path:
+
+```make
+ARCH    := $(SWITCH2_SHARED_ARCH)
+LDFLAGS := -specs=$(SWITCH2_SHARED_SPECS) $(ARCH)
+OVERLAY_LIBPATHS := $(SWITCH2_SHARED_LIBPATHS) $(OVERLAY_LIBPATHS)
+LIBS    := -lvulkan        # or: -lEGL -lGLESv2
+```
+
+A CMake project gets the same with `-DOUNCE_SHARED=ON` on libounce's
+toolchain (`aarch64-none-elf-cmake`), and a Meson or autotools project with
+`OUNCE_SHARED=1` exported before `switch2vars.sh` is sourced.
+`aarch64-none-elf-pkg-config` then answers from `lib/shared/pkgconfig`, so
+`vulkan`, `egl`, `glesv2` and `gl` name the shared libraries.
+
+The NROs that the program needs go on the SD card with libounce's
+`libounce.so.1` and `libstdc++.so.6`: in the program's folder, or in
+`sdmc:/kaihen/lib` for all programs. A program that loads a library by a
+Linux name needs that file there too.
+
+A module links either the static or the shared libraries, not both: the
+static `libEGL.a` holds a driver of its own.
+
 Mesa writes its log messages to `stderr`, as on other systems. To keep
 them, redirect `stderr` to a file on the SD card, for example with
 `freopen("sdmc:/log.txt", "w", stderr)`. `MESA_LOG_LEVEL` and the other

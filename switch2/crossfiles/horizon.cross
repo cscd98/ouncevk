@@ -8,11 +8,18 @@
 # The Switch 2's CPU has Cortex-A78C cores. The flags match SWITCH2_CPU in
 # libounce's switch2_cpu.mk, which homebrew programs build with; the Rust
 # target (toolchain/rust/aarch64-switch-horizon.json) names the same CPU.
+#
+# Thread-local variables use the initial-exec model, so that the same objects
+# make the static library and the shared library. A shared library's
+# thread-local variables are placed when the program starts, and its code
+# reads their offsets from the GOT. In the link of a statically linked
+# program the linker replaces that read with the offset itself, as
+# local-exec code has it.
 cpu_args = [
     '-mcpu=cortex-a78c+crypto',
     '-mtp=soft',
     '-fPIC',
-    '-ftls-model=local-exec',
+    '-ftls-model=initial-exec',
   ]
 compile_args = [
     '-D__SWITCH__',

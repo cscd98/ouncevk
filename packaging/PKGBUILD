@@ -44,5 +44,8 @@ build() {
 
 package() {
     cd /work
-    SRC=/work sh switch2/build/package-portlib.sh "$pkgdir/opt/devkitpro/portlibs/switch2"
+    SRC=/work OUNCE_NX=/ounce-nx sh switch2/build/package-portlib.sh "$pkgdir/opt/devkitpro/portlibs/switch2"
+    # The package always has the shared libraries.
+    test -f "$pkgdir/opt/devkitpro/portlibs/switch2/lib/shared/nro/libouncevk.so.1"
+    test -f "$pkgdir/opt/devkitpro/portlibs/switch2/lib/shared/nro/libouncevk-gl.so.1"
 }
